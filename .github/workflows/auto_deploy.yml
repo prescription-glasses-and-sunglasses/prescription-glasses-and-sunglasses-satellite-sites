@@ -1,38 +1,33 @@
-name: Auto Deploy
+name: Auto Deploy Satellite Sites
 
 on:
-push:
-branches:
-- main
-schedule:
-- cron: '0 0 * * *' # 每天 UTC 时间 00:00 运行一次
-workflow_dispatch: # 添加这一行，允许手动触发
+  schedule:
+    - cron: '0 0 * * *'  # 每天午夜运行
+  workflow_dispatch:      # 允许手动触发
 
 jobs:
-deploy:
-runs-on: ubuntu-latest
-permissions:
-contents: read
-
-steps:
-  - name: Checkout repository
-    uses: actions/checkout@v4
-
-  - name: Set up Python
-    uses: actions/setup-python@v4
-    with:
-      python-version: '3.10'
-
-  - name: Install dependencies
-    run: |
-      pip install google-api-python-client google-auth requests vercel netlify-cli
-
-  - name: Run deployment script
-    env:
-      GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
-      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-      NETLIFY_TOKEN: ${{ secrets.NETLIFY_TOKEN }}
-    run: |
-      python auto_deploy.py
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests google-auth-oauthlib google-auth-httplib2 google-api-python-client
+    
+    - name: Run deployment script
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # 使用 GitHub Actions 自动提供的 token
+        NETLIFY_TOKEN: ${{ secrets.NETLIFY_TOKEN }}
+        VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
+      run: |
+        python auto_deploy.py
