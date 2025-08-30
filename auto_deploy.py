@@ -1,30 +1,58 @@
 import os
+import io
 import json
-import tempfile
-import shutil
-import requests
 import random
+import requests
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
-import io
 
 # ------------------------
-# 配置
+# Google Drive 认证
 # ------------------------
-GDRIVE_SERVICE_ACCOUNT = os.environ.get("GDRIVE_SERVICE_ACCOUNT")
-GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
-NETLIFY_TOKEN = os.environ.get("NETLIFY_TOKEN")
-VERCEL_TOKEN = os.environ.get("VERCEL_TOKEN")
-PROJECT_TEMP_DIR = "publish_site"
+sa_info = json.loads(os.environ.get("GDRIVE_SERVICE_ACCOUNT"))
+GDRIVE_FOLDER_IDS = os.environ.get("GDRIVE_FOLDER_ID").split(",")  # 支持多个文件夹
 
-# ------------------------
-# Google Drive 初始化
-# ------------------------
 credentials = service_account.Credentials.from_service_account_info(
-    json.loads(GDRIVE_SERVICE_ACCOUNT)
+    sa_info,
+    scopes=["https://www.googleapis.com/auth/drive"]
 )
 service = build('drive', 'v3', credentials=credentials)
+
+# ------------------------
+# 下载和处理文件
+# ------------------------
+def download_html_file(file_id, file_name):
+    request = service.files().get_media(fileId=file_id)
+    fh = io.FileIO(file_name, 'wb')
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    print(f"✅ 已下载 {file_name}")
+
+def download_txt_file(file_id, file_name, original_name):
+    request = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    text_content = fh.getvalue().decode('utf-8')
+    is_html = text_content.strip().lower().startswith('<!doctype html') or text_content.strip().lower().startswith('<html')
+    html_content = text_content if is_html else f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>{original_name}</title></head><body><pre>{text_content}</pre></body></html>"
+    with open(file_name, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    print(f"✅ TXT 已转换为 HTML: {file_name}")
+
+def export_google_doc(file_id, file_name):
+    request = service.files().export_media(fileId=file_id, mimeType='text/html')
+    fh = io.FileIO(file_name, 'wb')
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    print(f"✅ Google 文档已导出为 HTML: {file_name}")
 
 def list_files(folder_id):
     results = service.files().list(
@@ -34,106 +62,99 @@ def list_files(folder_id):
     ).execute()
     return results.get('files', [])
 
-def download_html_file(file_id, file_name):
-    request = service.files().get_media(fileId=file_id)
-    fh = io.FileIO(file_name, 'wb')
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    print(f"✅ 下载完成: {file_name}")
-
-def download_txt_file(file_id, file_name):
-    request = service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    text_content = fh.getvalue().decode('utf-8')
-    html_content = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>{file_name}</title></head><body><pre>{text_content}</pre></body></html>"
-    with open(file_name, "w", encoding="utf-8") as f:
-        f.write(html_content)
-    print(f"✅ TXT 转 HTML: {file_name}")
+# ------------------------
+# 拉取所有文件
+# ------------------------
+all_files = []
+for folder_id in GDRIVE_FOLDER_IDS:
+    all_files.extend(list_files(folder_id))
 
 # ------------------------
-# 创建 index.html
+# 读取关键词
 # ------------------------
-def generate_index(dir_path):
-    html_files = [f for f in os.listdir(dir_path) if f.endswith(".html") and f != "index.html"]
-    index_content = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Site</title></head><body>\n<h1>Site</h1>\n<ul>\n"
-    for fname in sorted(html_files):
-        index_content += f'<li><a href="{fname}">{fname}</a></li>\n'
-    index_content += "</ul>\n</body></html>"
-    with open(os.path.join(dir_path, "index.html"), "w", encoding="utf-8") as f:
-        f.write(index_content)
+with open("keywords.txt", "r", encoding="utf-8") as f:
+    keywords = [line.strip() for line in f if line.strip()]
 
-# ------------------------
-# 部署到 Netlify
-# ------------------------
-def deploy_netlify(folder_path):
-    # 创建空站点
-    headers = {"Authorization": f"Bearer {NETLIFY_TOKEN}"}
-    r = requests.post("https://api.netlify.com/api/v1/sites", headers=headers)
-    site = r.json()
-    site_id = site["id"]
-    site_url = site["ssl_url"]
-    # 上传整个文件夹
-    for root, dirs, files in os.walk(folder_path):
-        for file in files:
-            full_path = os.path.join(root, file)
-            rel_path = os.path.relpath(full_path, folder_path)
-            with open(full_path, "rb") as f:
-                r2 = requests.put(
-                    f"https://api.netlify.com/api/v1/sites/{site_id}/files/{rel_path}",
-                    headers=headers,
-                    data=f
-                )
-                if r2.status_code not in [200,201]:
-                    print(f"❌ Netlify 上传失败: {rel_path} - {r2.text}")
-    print(f"✅ Netlify 部署完成: {site_url}")
-    return site_url
+processed_file_path = "processed_files.json"
+processed_data = {"fileIds": []}
+if os.path.exists(processed_file_path):
+    with open(processed_file_path, "r", encoding="utf-8") as f:
+        processed_data = json.load(f)
 
-# ------------------------
-# 部署到 Vercel
-# ------------------------
-def deploy_vercel(folder_path):
-    headers = {"Authorization": f"Bearer {VERCEL_TOKEN}"}
-    # 创建项目
-    data = {"name": f"site-{random.randint(1000,9999)}"}
-    r = requests.post("https://api.vercel.com/v9/projects", headers=headers, json=data)
-    project = r.json()
-    project_id = project["id"]
-    project_url = project["url"]
-    # 上传文件夹 (这里用 Vercel API 上传源码 zip 或通过 Git 方式部署)
-    # 简化: 可以先跳过文件上传，确保 URL 已生成
-    print(f"✅ Vercel 部署完成: {project_url}")
-    return f"https://{project_url}"
+new_files = [f for f in all_files if f['id'] not in processed_data["fileIds"]]
+num_to_process = min(len(new_files), 30)
+selected_files = random.sample(new_files, num_to_process) if new_files else []
 
-# ------------------------
-# 主流程
-# ------------------------
-if os.path.exists(PROJECT_TEMP_DIR):
-    shutil.rmtree(PROJECT_TEMP_DIR)
-os.makedirs(PROJECT_TEMP_DIR, exist_ok=True)
+available_keywords = list(keywords)
+for f in selected_files:
+    if available_keywords:
+        keyword = available_keywords.pop(0)
+        safe_name = keyword + ".html"
+    else:
+        base_name = os.path.splitext(f['name'])[0].replace(" ", "-").replace("/", "-")
+        random_suffix = str(random.randint(1000, 9999))
+        safe_name = f"{base_name}-{random_suffix}.html"
 
-files = list_files(GDRIVE_FOLDER_ID)
-for f in files:
-    safe_name = f['name'].replace(" ", "_")
     if f['mimeType'] == 'text/html':
-        download_html_file(f['id'], os.path.join(PROJECT_TEMP_DIR, safe_name))
+        download_html_file(f['id'], safe_name)
     elif f['mimeType'] == 'text/plain':
-        download_txt_file(f['id'], os.path.join(PROJECT_TEMP_DIR, safe_name))
+        download_txt_file(f['id'], safe_name, f['name'])
+    else:
+        export_google_doc(f['id'], safe_name)
 
-generate_index(PROJECT_TEMP_DIR)
+    processed_data["fileIds"].append(f['id'])
 
-# 随机选择要部署的 10 个文件夹
-# 这里直接部署整个文件夹
+with open(processed_file_path, "w", encoding="utf-8") as f:
+    json.dump(processed_data, f, indent=4)
+
+with open("keywords.txt", "w", encoding="utf-8") as f:
+    for k in available_keywords:
+        f.write(k + "\n")
+
+# ------------------------
+# 随机部署到 Vercel / Netlify
+# ------------------------
+VERCEL_TOKEN = os.environ.get("VERCEL_TOKEN")
+NETLIFY_TOKEN = os.environ.get("NETLIFY_TOKEN")
+
+html_files = [f for f in os.listdir(".") if f.endswith(".html")]
+vercel_files = random.sample(html_files, min(10, len(html_files)))
+remaining_files = list(set(html_files) - set(vercel_files))
+netlify_files = random.sample(remaining_files, min(10, len(remaining_files)))
+
 site_urls = []
-site_urls.append(deploy_netlify(PROJECT_TEMP_DIR))
-site_urls.append(deploy_vercel(PROJECT_TEMP_DIR))
 
+def deploy_vercel(file_list):
+    headers = {"Authorization": f"Bearer {VERCEL_TOKEN}"}
+    for file in file_list:
+        try:
+            resp = requests.post("https://api.vercel.com/v13/deployments", headers=headers, files={"file": open(file, "rb")})
+            if resp.status_code in [200, 201]:
+                site_urls.append(resp.json().get("url"))
+                print(f"✅ 部署到 Vercel: {file}")
+            else:
+                print(f"❌ Vercel 部署失败: {file} - {resp.text}")
+        except Exception as e:
+            print(f"❌ Vercel 部署异常: {file} - {e}")
+
+def deploy_netlify(file_list):
+    headers = {"Authorization": f"Bearer {NETLIFY_TOKEN}"}
+    for file in file_list:
+        try:
+            resp = requests.post("https://api.netlify.com/api/v1/sites", headers=headers, files={"file": open(file, "rb")})
+            if resp.status_code in [200, 201]:
+                site_urls.append(resp.json().get("url"))
+                print(f"✅ 部署到 Netlify: {file}")
+            else:
+                print(f"❌ Netlify 部署失败: {file} - {resp.text}")
+        except Exception as e:
+            print(f"❌ Netlify 部署异常: {file} - {e}")
+
+deploy_vercel(vercel_files)
+deploy_netlify(netlify_files)
+
+# 保存 siteurl.txt
 with open("siteurl.txt", "w", encoding="utf-8") as f:
     for url in site_urls:
         f.write(url + "\n")
-print("✅ 所有部署 URL 已保存到 siteurl.txt")
+print("✅ 部署 URL 已保存到 siteurl.txt")
