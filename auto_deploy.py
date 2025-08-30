@@ -7,10 +7,10 @@ import json
 import random
 import shutil
 import logging
+import subprocess
 import requests
 from pathlib import Path
 from typing import List, Optional
-from setup_github import GitHubSetup
 
 # -----------------------------
 # 日志配置
@@ -30,7 +30,6 @@ REQUEST_TIMEOUT = 30             # API超时时间（秒）
 class DeployManager:
     def __init__(self):
         self.config = self.load_config()
-        self.github = GitHubSetup(self.config["github_token"], self.config["github_username"])
         self.netlify_sites: List[str] = []
         self.vercel_sites: List[str] = []
 
@@ -87,14 +86,21 @@ class DeployManager:
 
     def push_to_github(self, repo_name: str, repo_dir: Path) -> Optional[str]:
         """上传内容到 GitHub"""
-        repo = self.github.create_repo(repo_name, is_private=True)
-        if not repo:
+        repo_url = f"https://{self.config['github_username']}:{self.config['github_token']}@github.com/{self.config['github_username']}/{repo_name}.git"
+        try:
+            os.chdir(repo_dir)
+            subprocess.run(["git", "init"], check=True)
+            subprocess.run(["git", "add", "."], check=True)
+            subprocess.run(["git", "commit", "-m", "Initial commit"], check=True)
+            subprocess.run(["git", "branch", "-M", "main"], check=True)
+            subprocess.run(["git", "remote", "add", "origin", repo_url], check=True)
+            subprocess.run(["git", "push", "-u", "origin", "main", "--force"], check=True)
+            os.chdir("..")
+            return f"https://github.com/{self.config['github_username']}/{repo_name}"
+        except Exception as e:
+            logger.error(f"推送 GitHub 出错: {e}")
+            os.chdir("..")
             return None
-
-        for file in repo_dir.glob("*"):
-            self.github.upload_file(repo_name, str(file), github_path=file.name, commit_message="Add content")
-
-        return f"https://github.com/{self.config['github_username']}/{repo_name}"
 
     def deploy_to_netlify(self, repo_url: str) -> Optional[str]:
         """部署到 Netlify"""
@@ -176,7 +182,7 @@ class DeployManager:
             return False
 
         repo_name = f"satellite-{int(time.time())}"
-        temp_dir = Path(f"temp_repo")
+        temp_dir = Path("temp_repo")
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
 
