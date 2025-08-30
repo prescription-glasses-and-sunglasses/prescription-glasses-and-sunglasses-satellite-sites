@@ -6,6 +6,7 @@ branches:
 - main
 schedule:
 - cron: '0 0 * * *' # 每天 UTC 时间 00:00 运行一次
+workflow_dispatch: # 添加这一行，允许手动触发
 
 jobs:
 deploy:
