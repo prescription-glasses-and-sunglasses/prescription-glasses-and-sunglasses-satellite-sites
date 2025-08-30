@@ -1244,8 +1244,6 @@ def main(config: PlatformConfig):
             if vercel_url:
                 vercel_urls.append(vercel_url)
                 successful_deployments += 1
-            
-        # 部署到 Netlify 或 Vercel
     # 所有部署完成，生成站点地图
     if netlify_urls or vercel_urls:
         sitemap_file = Path("sitemap.html")
@@ -1254,9 +1252,7 @@ def main(config: PlatformConfig):
         
     logger.info(f"部署完成！成功部署了 {successful_deployments} 个站点")
     logger.info(f"Netlify 站点: {len(netlify_urls)}, Vercel 站点: {len(vercel_urls)}")
-        logger.info(f"Successfully deployed {successful_deployments} satellite sites")
-        return True
-    else:
+    
     # 返回是否成功部署了至少一个站点
     return successful_deployments > 0
 
