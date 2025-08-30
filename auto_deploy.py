@@ -47,16 +47,18 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 @dataclass
 class PlatformConfig:
-    netlify_token: str
-    github_username: str
-    processed_files_path: str = "processed_files.json"
-    vercel_token: str
-    github_token: str      # GitHub Personal Access Token
-    github_username: str
-    satellite_count: int
-    repo_prefix: str       # GitHub仓库名称前缀
-    gdrive_folder_id: str  # Google Drive文件夹ID
-    gdrive_service_account: str  # Google Drive服务账号JSON
+    # 必需的认证信息
+    github_token: str          # GitHub Personal Access Token
+    github_username: str       # GitHub 用户名
+    netlify_token: str        # Netlify 认证令牌
+    vercel_token: str         # Vercel 认证令牌
+    gdrive_folder_id: str     # Google Drive 文件夹 ID
+    gdrive_service_account: str  # Google Drive 服务账号 JSON
+    
+    # 可选配置，带默认值
+    repo_prefix: str = "satellite"       # GitHub 仓库名称前缀
+    satellite_count: int = 10            # 卫星站点数量
+    processed_files_path: str = "processed_files.json"  # 已处理文件记录路径
 
 CONFIG_FILE = Path("config.csv")
 GDRIVE_CONFIG_FILE = Path("gdrive_config.txt")  # Google Drive 配置文件
@@ -200,32 +202,139 @@ def download_drive_file(file_id: str, output_path: Path, mime_type: str) -> bool
         return False
 
 # -----------------------------
+# Helper: 文件处理记录管理
+# -----------------------------
+def load_processed_files(config: PlatformConfig) -> Set[str]:
+    """加载已处理过的文件ID列表"""
+    try:
+        if os.path.exists(config.processed_files_path):
+            with open(config.processed_files_path, 'r') as f:
+                data = json.load(f)
+                return set(data.get('fileIds', []))
+    except Exception as e:
+        logger.error(f"读取已处理文件记录失败: {e}")
+    return set()
+
+def save_processed_files(processed_files: Set[str], config: PlatformConfig):
+    """保存已处理过的文件ID列表"""
+    try:
+        with open(config.processed_files_path, 'w') as f:
+            json.dump({"fileIds": list(processed_files)}, f, indent=4)
+    except Exception as e:
+        logger.error(f"保存已处理文件记录失败: {e}")
+
+def get_files_from_folder(service, folder_id: str) -> List[Dict[str, str]]:
+    """从指定的 Google Drive 文件夹获取文件列表"""
+    try:
+        results = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id, name, mimeType)"
+        ).execute()
+        return results.get('files', [])
+    except Exception as e:
+        logger.error(f"获取文件夹 {folder_id} 的文件列表时出错: {e}")
+        return []
+
+def download_file_content(service, file_id: str) -> Optional[str]:
+    """下载文件内容"""
+    try:
+        file = service.files().get(fileId=file_id, fields='mimeType').execute()
+        mime_type = file['mimeType']
+        
+        if mime_type.startswith('text/html'):
+            request = service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            return fh.getvalue().decode('utf-8')
+        
+        elif mime_type == 'text/plain':
+            request = service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            text_content = fh.getvalue().decode('utf-8')
+            
+            if text_content.strip().lower().startswith(('<!doctype html', '<html')):
+                return text_content
+            else:
+                return f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset='utf-8'>
+    <title>{file['name']}</title>
+</head>
+<body>
+    <pre>{text_content}</pre>
+</body>
+</html>"""
+        
+        elif mime_type == 'application/vnd.google-apps.document':
+            request = service.files().export_media(fileId=file_id, mimeType='text/html')
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            return fh.getvalue().decode('utf-8')
+        
+        return None
+    except Exception as e:
+        logger.error(f"下载文件 {file_id} 内容时出错: {e}")
+        return None
+
+# -----------------------------
 # Helper: 配置管理
 # -----------------------------
 def create_example_config():
     """创建示例配置文件并显示配置说明"""
     if not CONFIG_FILE.exists():
+        config_fields = [
+            'github_token',
+            'github_username',
+            'netlify_token',
+            'vercel_token',
+            'gdrive_folder_id',
+            'gdrive_service_account',
+            'repo_prefix',
+            'satellite_count',
+            'processed_files_path'
+        ]
+        
+        example_values = [
+            'your_github_token',           # GitHub Personal Access Token
+            'your_github_username',        # GitHub用户名
+            'your_netlify_token',          # Netlify API Token
+            'your_vercel_token',           # Vercel API Token
+            'your_gdrive_folder_id',       # Google Drive 文件夹ID
+            '{}',                          # Google Drive 服务账号 JSON
+            'satellite',                   # 仓库名称前缀
+            '10',                          # 要创建的卫星站数量
+            'processed_files.json'         # 已处理文件记录路径
+        ]
+        
         with open(CONFIG_FILE, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            # 写入表头
-            writer.writerow(['netlify_token', 'vercel_token', 'github_token', 'github_username', 
-                           'satellite_count', 'repo_prefix', 'gdrive_folder_id', 'gdrive_service_account'])
-            # 写入示例数据
-            writer.writerow([
-                'your_netlify_token',          # Netlify API Token
-                'your_vercel_token',           # Vercel API Token
-                'your_github_token',           # GitHub Personal Access Token
-                'your_github_username',        # GitHub用户名
-                '10',                          # 要创建的卫星站数量
-                'mysite',                      # 仓库名称前缀
-                'your_gdrive_folder_id',       # Google Drive 文件夹ID
-                '{}'                           # Google Drive 服务账号 JSON
-            ])
+            writer.writerow(config_fields)
+            writer.writerow(example_values)
         
         # 打印配置说明
+        logger.info(f"\n===== 配置说明 =====")
         logger.info(f"已创建配置文件: {CONFIG_FILE}")
-        logger.info("\n配置说明：")
-        logger.info("1. netlify_token: Netlify的API令牌")
+        logger.info("\n请在配置文件中填写以下信息：")
+        logger.info("1. github_token: GitHub的个人访问令牌")
+        logger.info("2. github_username: GitHub用户名")
+        logger.info("3. netlify_token: Netlify的API令牌")
+        logger.info("4. vercel_token: Vercel的API令牌")
+        logger.info("5. gdrive_folder_id: Google Drive文件夹ID")
+        logger.info("6. gdrive_service_account: Google Drive服务账号JSON")
+        logger.info("7. repo_prefix: 仓库名称前缀，默认为'satellite'")
+        logger.info("8. satellite_count: 要创建的卫星站数量，默认为10")
+        logger.info("9. processed_files_path: 已处理文件记录路径，默认为'processed_files.json'")
         logger.info("2. vercel_token: Vercel的API令牌")
         logger.info("3. github_token: GitHub的个人访问令牌")
         logger.info("4. github_username: GitHub用户名")
@@ -238,34 +347,39 @@ def create_example_config():
 
 def load_platform_config() -> PlatformConfig:
     """加载平台配置"""
-    # 首先尝试从CSV文件加载
-    if CONFIG_FILE.exists():
-        try:
+    try:
+        # 优先从环境变量获取配置
+        config_dict = {
+            'github_token': os.getenv('GITHUB_TOKEN', ''),
+            'github_username': os.getenv('GITHUB_USERNAME', ''),
+            'netlify_token': os.getenv('NETLIFY_TOKEN', ''),
+            'vercel_token': os.getenv('VERCEL_TOKEN', ''),
+            'gdrive_folder_id': os.getenv('GDRIVE_FOLDER_ID', ''),
+            'gdrive_service_account': os.getenv('GDRIVE_SERVICE_ACCOUNT', ''),
+            'repo_prefix': os.getenv('REPO_PREFIX', 'satellite'),
+            'satellite_count': int(os.getenv('SATELLITE_COUNT', '10')),
+            'processed_files_path': os.getenv('PROCESSED_FILES_PATH', 'processed_files.json')
+        }
+        
+        # 如果配置文件存在，用其补充缺失的配置
+        if CONFIG_FILE.exists():
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
-                config = next(reader)
-                return PlatformConfig(
-                    netlify_token=config['netlify_token'],
-                    vercel_token=config['vercel_token'],
-                    github_token=config['github_token'],
-                    github_username=config['github_username'],
-                    satellite_count=int(config['satellite_count']),
-                    repo_prefix=config['repo_prefix'],
-                    gdrive_folder_id=config['gdrive_folder_id'],
-                    gdrive_service_account=config['gdrive_service_account']
-                )
-        except Exception as e:
-            logger.error(f"读取配置文件出错: {e}")
-    
-    # 回退到环境变量
-    return PlatformConfig(
-        netlify_token=os.getenv("NETLIFY_TOKEN", ""),
-        vercel_token=os.getenv("VERCEL_TOKEN", ""),
-        github_token=os.getenv("GITHUB_TOKEN", ""),
-        github_username=os.getenv("GITHUB_USERNAME", "YOUR_USERNAME"),
-        satellite_count=int(os.getenv("SATELLITE_COUNT", "10")),
-        repo_prefix=os.getenv("REPO_PREFIX", "mysite")
-    )
+                file_config = next(reader)
+                
+                # 只更新环境变量中没有的值
+                for key in config_dict:
+                    if not config_dict[key] and key in file_config:
+                        if key == 'satellite_count':
+                            config_dict[key] = int(file_config[key])
+                        else:
+                            config_dict[key] = file_config[key]
+        
+        return PlatformConfig(**config_dict)
+        
+    except Exception as e:
+        logger.error(f"加载配置时出错: {e}")
+        return None
 
 # -----------------------------
 # Helper: 缓存管理
@@ -464,31 +578,50 @@ def distribute_articles(all_articles: List[Dict[str, str]], new_articles: List[D
         'vercel': vercel_articles
     }
 
-def load_articles_from_drive() -> List[Dict[str, str]]:
-    """从 Google Drive 获取文章内容"""
-    # 从环境变量获取 Google Drive 文件夹 ID
-    folder_id = os.environ.get("GDRIVE_FOLDER_ID")
+def load_articles_from_drive(service, config: PlatformConfig) -> tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """从 Google Drive 获取文章内容，返回 (所有文章列表, 新文章列表)"""
+    folder_id = config.gdrive_folder_id
     if not folder_id:
-        logger.error("未找到 GDRIVE_FOLDER_ID 环境变量")
-        return []
+        logger.error("未设置 Google Drive 文件夹 ID")
+        return [], []
     
-    # 获取所有文件
-    files = get_drive_files(service, folder_id)
-    if not files:
-        return []
-    
-    # 获取所有文件
-    all_files = []
-    for folder_id in folder_ids:
-        files = get_drive_files(folder_id)
-        all_files.extend(files)
-    
-    # 过滤出未处理的文件
-    new_files = [f for f in all_files if f['id'] not in processed_files]
-    
-    if not new_files:
-        logger.info("没有新的文件需要处理")
-        return []
+    try:
+        # 获取已处理文件记录
+        processed_files = load_processed_files(config)
+        
+        # 获取所有文件
+        files = get_files_from_folder(service, folder_id)
+        if not files:
+            logger.info("Google Drive 文件夹为空")
+            return [], []
+        
+        all_articles = []
+        new_articles = []
+        
+        for file in files:
+            content = download_file_content(service, file['id'])
+            if content:
+                article = {
+                    'id': file['id'],
+                    'name': file['name'],
+                    'content': content
+                }
+                all_articles.append(article)
+                
+                # 如果是新文件，添加到新文章列表
+                if file['id'] not in processed_files:
+                    new_articles.append(article)
+                    processed_files.add(file['id'])
+        
+        # 保存更新后的已处理文件记录
+        save_processed_files(processed_files, config)
+        
+        logger.info(f"从 Google Drive 获取了 {len(all_articles)} 篇文章，其中 {len(new_articles)} 篇是新文章")
+        return all_articles, new_articles
+        
+    except Exception as e:
+        logger.error(f"获取 Google Drive 文章时出错: {e}")
+        return [], []
     
     # 随机选择要处理的文件
     num_to_process = min(len(new_files), 30)
@@ -1077,55 +1210,54 @@ def main(config: PlatformConfig):
         create_vercel_site(distributed_articles['vercel'])
     
     logger.info(f"成功获取了 {len(all_articles)} 篇文章，其中 {len(new_articles)} 篇是新文章")
-    logger.info(f"加载了 {len(cross_links)} 个跨平台链接")
     
     netlify_urls = []
     vercel_urls = []
     successful_deployments = 0
-
-    # 从配置文件读取卫星站数量
-    logger.info(f"将创建 {config.satellite_count} 个卫星站")
-
-    for i in range(config.satellite_count):
-        logger.info(f"处理卫星站 {i+1}/{config.satellite_count}")
-        
-        # 生成仓库名
-        repo_name = generate_repo_name(config.repo_prefix)
-        
-        # 创建仓库并添加内容
-        repo_url = create_repo_with_content(repo_name, articles, cross_links)
-        if not repo_url:
-            logger.error(f"创建仓库 {repo_name} 失败")
+    
+    # 开始部署到不同平台
+    logger.info("开始部署到不同平台...")
+    
+    for platform, articles in distributed_articles.items():
+        if not articles:
             continue
             
+        if platform == 'github':
+            # 部署到 GitHub Pages
+            logger.info(f"部署 {len(articles)} 篇新文章到 GitHub Pages")
+            github_url = create_repo_with_content(f"{config.github_username}.github.io", articles)
+            if github_url:
+                successful_deployments += 1
+                
+        elif platform == 'netlify':
+            # 部署到 Netlify
+            logger.info(f"部署 {len(articles)} 篇随机文章到 Netlify")
+            netlify_url = create_netlify_site(articles)
+            if netlify_url:
+                netlify_urls.append(netlify_url)
+                successful_deployments += 1
+                
+        elif platform == 'vercel':
+            # 部署到 Vercel
+            logger.info(f"部署 {len(articles)} 篇随机文章到 Vercel")
+            vercel_url = create_vercel_site(articles)
+            if vercel_url:
+                vercel_urls.append(vercel_url)
+                successful_deployments += 1
+            
         # 部署到 Netlify 或 Vercel
-        if i % 2 == 0 and NETLIFY_TOKEN:
-            site_url = create_netlify_site(repo_name, f"{config.github_username}/{repo_name}")
-            if site_url:
-                netlify_urls.append(site_url)
-                successful_deployments += 1
-        elif VERCEL_TOKEN:
-            site_url = create_vercel_site(repo_name, f"{config.github_username}/{repo_name}")
-            if site_url:
-                vercel_urls.append(site_url)
-                successful_deployments += 1
-        time.sleep(2)  # 添加延迟避免API限制
-
-    # 所有卫星站部署完成，生成站点地图
-    if successful_deployments > 0:
+    # 所有部署完成，生成站点地图
+    if netlify_urls or vercel_urls:
         sitemap_file = Path("sitemap.html")
         generate_sitemap(netlify_urls, vercel_urls, sitemap_file)
+        logger.info(f"生成站点地图: {sitemap_file}")
+        
+    logger.info(f"部署完成！成功部署了 {successful_deployments} 个站点")
+    logger.info(f"Netlify 站点: {len(netlify_urls)}, Vercel 站点: {len(vercel_urls)}")
         logger.info(f"Successfully deployed {successful_deployments} satellite sites")
         return True
     else:
-        logger.error("No satellite sites were deployed successfully")
-        return False
-    if netlify_urls or vercel_urls:
-        generate_sitemap(netlify_urls, vercel_urls, Path("satellite_sitemap.html"))
-    
-    logger.info(f"Deployment completed! Successfully deployed {successful_deployments}/{SATELLITE_COUNT} satellites")
-    logger.info(f"Netlify sites: {len(netlify_urls)}, Vercel sites: {len(vercel_urls)}")
-    
+    # 返回是否成功部署了至少一个站点
     return successful_deployments > 0
 
 if __name__ == "__main__":
