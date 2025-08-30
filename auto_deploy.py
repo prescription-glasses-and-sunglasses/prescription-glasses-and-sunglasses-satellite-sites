@@ -6,10 +6,15 @@ import json
 import csv
 import subprocess
 import shutil
+import io
 from pathlib import Path
 import requests
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
+from dataclasses import dataclass
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 import logging
 from setup_github import GitHubSetup
 
@@ -285,14 +290,7 @@ if __name__ == "__main__":
         deployer.run()
     except Exception as e:
         logger.error(f"执行过程出错: {e}")
-        sys.exit(1)return []
-            
-        all_articles = list(ARTICLES_DIR.glob("*.html"))
-        if not all_articles:
-            logger.error(f"在 {ARTICLES_DIR} 中没有找到任何HTML文章")
-            return []
-            
-        return random.sample(all_articles, min(count, len(all_articles)))
+        sys.exit(1)
 
     def deploy_to_netlify(self, repo_url: str, site_name: str = None) -> str:
         """部署到 Netlify"""
