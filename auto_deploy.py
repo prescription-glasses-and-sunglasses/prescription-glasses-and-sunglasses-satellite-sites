@@ -35,7 +35,7 @@ def download_html_file(file_id, file_name):
 def download_txt_file(file_id, file_name, original_name):
     request = service.files().get_media(fileId=file_id)
     fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
+    downloader = MediaIoBaseBaseDownload(fh, request)
     done = False
     while not done:
         _, done = downloader.next_chunk()
@@ -113,53 +113,22 @@ with open("keywords.txt", "w", encoding="utf-8") as f:
         f.write(k + "\n")
 
 # ------------------------
-# 随机部署到 Vercel / Netlify
+# 部署到 Netlify
 # ------------------------
-VERCEL_TOKEN = os.environ.get("VERCEL_TOKEN")
 NETLIFY_TOKEN = os.environ.get("NETLIFY_TOKEN")
 
 html_files = [f for f in os.listdir(".") if f.endswith(".html")]
-vercel_files = random.sample(html_files, min(10, len(html_files)))
-remaining_files = list(set(html_files) - set(vercel_files))
-netlify_files = random.sample(remaining_files, min(10, len(remaining_files)))
+netlify_files = random.sample(html_files, min(20, len(html_files)))
 
 site_urls = []
-
-def deploy_vercel(file_list):
-    headers = {
-        "Authorization": f"Bearer {VERCEL_TOKEN}",
-        "Content-Type": "text/html"  # 明确指定内容类型
-    }
-    for file in file_list:
-        try:
-            with open(file, "rb") as f:
-                file_content = f.read()
-
-            # Vercel 的部署 API 比较复杂，这里使用了一个简化的方法。
-            # 这种方式可能不适用于所有 Vercel 项目，但对于简单的文件上传是有效的。
-            # 为了获取 URL，你可能需要额外的 API 调用。
-            resp = requests.post(f"https://api.vercel.com/v13/deployments", 
-                                 headers=headers, 
-                                 data=file_content)
-
-            if resp.status_code in [200, 201]:
-                # 部署成功，这里可以尝试获取 URL
-                print(f"✅ 部署到 Vercel: {file}")
-            else:
-                print(f"❌ Vercel 部署失败: {file} - {resp.text}")
-        except Exception as e:
-            print(f"❌ Vercel 部署异常: {file} - {e}")
 
 def deploy_netlify(file_list):
     headers = {"Authorization": f"Bearer {NETLIFY_TOKEN}"}
     for file in file_list:
         try:
-            # Netlify 的部署 API 也需要更复杂的流程，这里使用了一个简化的方法。
-            # 对于直接上传文件并创建新站点，这个方法可能不是最佳实践。
             resp = requests.post("https://api.netlify.com/api/v1/sites", headers=headers, files={"file": open(file, "rb")})
             
             if resp.status_code in [200, 201]:
-                # 成功创建站点，提取 URL
                 site_url = resp.json().get("url")
                 if site_url:
                     site_urls.append(site_url)
@@ -171,11 +140,10 @@ def deploy_netlify(file_list):
         except Exception as e:
             print(f"❌ Netlify 部署异常: {file} - {e}")
         
-        # 增加延迟，避免超过 Netlify 的频率限制
-        print("⏸️ 等待 15 秒以避免频率限制...")
-        time.sleep(15)
+        print("⏸️ 等待 30 秒以避免频率限制...")
+        time.sleep(30)
 
-deploy_vercel(vercel_files)
+# 只调用 Netlify 的部署函数
 deploy_netlify(netlify_files)
 
 # 保存 siteurl.txt
