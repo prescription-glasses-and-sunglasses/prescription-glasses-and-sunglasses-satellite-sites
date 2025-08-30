@@ -4,7 +4,9 @@ import sys
 import io
 import random
 import time
-import re # 导入正则表达式模块
+import re
+import subprocess
+import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -170,6 +172,111 @@ def export_google_doc(file_id, file_name):
     print(f"✅ Google 文档已导出为 HTML: {file_name}")
 
 # ------------------------
+# 部署到目标平台
+# ------------------------
+def deploy_to_target(target):
+    """使用 Vercel 和 Netlify CLI 部署到指定的项目和站点。"""
+    print(f"🚀 正在部署到 Vercel 项目: {target['vercel_project_id']}")
+    vercel_command = [
+        "vercel", "--prod", "--yes",
+        "--token", os.environ.get("VERCEL_TOKEN"),
+        "--project", target["vercel_project_id"],
+        "--scope", os.environ.get("VERCEL_ORG_ID")
+    ]
+    try:
+        subprocess.run(vercel_command, check=True)
+        print("✅ Vercel 部署成功！")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Vercel 部署失败: {e}")
+        return
+
+    print(f"🚀 正在部署到 Netlify 站点: {target['netlify_site_id']}")
+    netlify_command = [
+        "netlify", "deploy", "--dir", ".", "--prod", "--site", target["netlify_site_id"]
+    ]
+    try:
+        subprocess.run(netlify_command, check=True)
+        print("✅ Netlify 部署成功！")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Netlify 部署失败: {e}")
+
+# ------------------------
+# 新增的 API 创建函数
+# ------------------------
+def create_new_target_api(vercel_token, netlify_token, vercel_org_id):
+    """
+    通过 API 创建新的 Vercel 和 Netlify 项目。
+    """
+    project_name = f"auto-site-{int(time.time())}"
+    
+    print("----------------------------------------------------------------------")
+    print(f"🚀 正在通过 API 创建新的 Vercel 项目: {project_name}")
+    print("----------------------------------------------------------------------")
+
+    # Vercel API 调用
+    vercel_url = f"https://api.vercel.com/v9/projects?{f'teamId={vercel_org_id}' if vercel_org_id else ''}"
+    vercel_headers = {
+        "Authorization": f"Bearer {vercel_token}",
+        "Content-Type": "application/json"
+    }
+    vercel_payload = {
+        "name": project_name,
+        "framework": None,
+        "git": None
+    }
+    try:
+        response = requests.post(vercel_url, headers=vercel_headers, json=vercel_payload)
+        response.raise_for_status()
+        vercel_data = response.json()
+        new_vercel_project_id = vercel_data.get('id')
+        print(f"✅ Vercel 项目创建成功，ID: {new_vercel_project_id}")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Vercel API 调用失败: {e}")
+        return None
+
+    print("----------------------------------------------------------------------")
+    print(f"🚀 正在通过 API 创建新的 Netlify 站点: {project_name}")
+    print("----------------------------------------------------------------------")
+
+    # Netlify API 调用
+    netlify_url = "https://api.netlify.com/api/v1/sites"
+    netlify_headers = {
+        "Authorization": f"Bearer {netlify_token}",
+        "Content-Type": "application/json"
+    }
+    netlify_payload = {
+        "name": project_name
+    }
+    try:
+        response = requests.post(netlify_url, headers=netlify_headers, json=netlify_payload)
+        response.raise_for_status()
+        netlify_data = response.json()
+        new_netlify_site_id = netlify_data.get('site_id')
+        print(f"✅ Netlify 站点创建成功，ID: {new_netlify_site_id}")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Netlify API 调用失败: {e}")
+        return None
+    
+    new_target = {
+        "vercel_project_id": new_vercel_project_id,
+        "netlify_site_id": new_netlify_site_id
+    }
+    
+    deploy_targets_file = "deploy_targets.json"
+    try:
+        with open(deploy_targets_file, "r+") as f:
+            targets = json.load(f)
+            targets.append(new_target)
+            f.seek(0)
+            json.dump(targets, f, indent=4)
+    except FileNotFoundError:
+        with open(deploy_targets_file, "w") as f:
+            json.dump([new_target], f, indent=4)
+            
+    print(f"\n✅ 已成功创建并保存新的部署目标到 {deploy_targets_file}！")
+    return new_target
+
+# ------------------------
 # 主程序
 # ------------------------
 all_files = get_cached_files()
@@ -187,8 +294,6 @@ new_files = [f for f in all_files if f['id'] not in processed_data["fileIds"]]
 
 if not new_files:
     print("✅ 没有新的文件需要处理。")
-    # 即使没有新文件，也需要重新生成内部链接，以防万一
-    print("重新生成所有页面的内部链接...")
 else:
     print(f"发现 {len(new_files)} 个未处理文件。")
     num_to_process = min(len(new_files), 30)
@@ -283,3 +388,47 @@ for fname in all_html_files:
         print(f"无法为 {fname} 处理内部链接: {e}")
 
 print("✅ 已为所有页面更新底部随机内部链接 (每个 4-6 个，完全刷新)")
+
+
+# ------------------------
+# 部署部分 (新)
+# ------------------------
+deploy_targets_file = "deploy_targets.json"
+
+try:
+    if os.path.exists(deploy_targets_file):
+        with open(deploy_targets_file, "r") as f:
+            deploy_targets = json.load(f)
+            if not isinstance(deploy_targets, list) or not deploy_targets:
+                raise ValueError("deploy_targets.json 格式不正确，它应该是一个包含目标的非空列表。")
+    else:
+        # 如果文件不存在，进入 API 创建模式
+        print(f"❌ 未找到 {deploy_targets_file} 文件。")
+        deploy_targets = [create_new_target_api(
+            os.environ.get("VERCEL_TOKEN"),
+            os.environ.get("NETLIFY_TOKEN"),
+            os.environ.get("VERCEL_ORG_ID")
+        )]
+
+    # 使用一个简单的轮循方法来选择目标
+    current_target_index_file = "current_target_index.txt"
+    current_index = 0
+    if os.path.exists(current_target_index_file):
+        try:
+            with open(current_target_index_file, "r") as f:
+                current_index = int(f.read().strip())
+        except (IOError, ValueError):
+            pass
+
+    target_index_to_use = current_index % len(deploy_targets)
+    selected_target = deploy_targets[target_index_to_use]
+
+    print(f"🎯 正在使用目标索引 {target_index_to_use} 进行部署。")
+    deploy_to_target(selected_target)
+
+    # 更新索引以便下次运行
+    with open(current_target_index_file, "w") as f:
+        f.write(str(target_index_to_use + 1))
+except (json.JSONDecodeError, ValueError) as e:
+    print(f"❌ 读取或解析 {deploy_targets_file} 时出错: {e}")
+    sys.exit(1)
