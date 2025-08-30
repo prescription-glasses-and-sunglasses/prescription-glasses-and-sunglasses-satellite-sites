@@ -1,0 +1,7 @@
+# 跨平台链接配置文件
+# 格式：每行一个链接
+# 可以添加注释，以#开头的行将被忽略
+# 示例：
+# https://example1.netlify.app
+# https://example2.vercel.app
+# https://example3.github.io
