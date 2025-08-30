@@ -35,7 +35,7 @@ def download_html_file(file_id, file_name):
 def download_txt_file(file_id, file_name, original_name):
     request = service.files().get_media(fileId=file_id)
     fh = io.BytesIO()
-    downloader = MediaIoBaseBaseDownload(fh, request)
+    downloader = MediaIoBaseDownload(fh, request)
     done = False
     while not done:
         _, done = downloader.next_chunk()
@@ -151,3 +151,4 @@ with open("siteurl.txt", "w", encoding="utf-8") as f:
     for url in site_urls:
         f.write(url + "\n")
 print("✅ 部署 URL 已保存到 siteurl.txt")
+
