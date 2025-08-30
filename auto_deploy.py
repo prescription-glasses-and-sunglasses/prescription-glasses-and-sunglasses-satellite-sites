@@ -1,6 +1,5 @@
 import os
 import json
-import sys
 import io
 import random
 import time
@@ -17,13 +16,13 @@ from googleapiclient.http import MediaIoBaseDownload
 owner_repo = os.environ.get("GITHUB_REPOSITORY")
 if not owner_repo:
     print("❌ 未找到 GITHUB_REPOSITORY 环境变量")
-    sys.exit(1)
+    exit(1)
 
 GITHUB_USERNAME, GITHUB_REPO = owner_repo.split("/")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # Actions 默认提供
 if not GITHUB_TOKEN:
     print("❌ 未找到 GITHUB_TOKEN 环境变量")
-    sys.exit(1)
+    exit(1)
 
 headers = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -36,13 +35,13 @@ headers = {
 service_account_info = os.environ.get("GDRIVE_SERVICE_ACCOUNT")
 if not service_account_info:
     print("❌ 未找到 GDRIVE_SERVICE_ACCOUNT 环境变量")
-    sys.exit(1)
+    exit(1)
 
 try:
     service_account_info = json.loads(service_account_info)
 except json.JSONDecodeError:
     print("❌ GDRIVE_SERVICE_ACCOUNT JSON解析失败")
-    sys.exit(1)
+    exit(1)
 
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 creds = service_account.Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
@@ -54,7 +53,7 @@ service = build('drive', 'v3', credentials=creds)
 folder_ids_str = os.environ.get("GDRIVE_FOLDER_ID")
 if not folder_ids_str:
     print("❌ 未找到 GDRIVE_FOLDER_ID 环境变量")
-    sys.exit(1)
+    exit(1)
 
 FOLDER_IDS = [fid.strip() for fid in folder_ids_str.split(",") if fid.strip()]
 
@@ -136,6 +135,7 @@ def download_html_file(file_id, file_name):
     done = False
     while not done:
         _, done = downloader.next_chunk()
+    print(f"✅ 下载 HTML: {file_name}")
 
 def download_txt_file(file_id, file_name, original_name):
     request = service.files().get_media(fileId=file_id)
@@ -152,6 +152,7 @@ def download_txt_file(file_id, file_name, original_name):
         html_content = f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>{original_name}</title></head><body><pre>{text_content}</pre></body></html>"
     with open(file_name, 'w', encoding='utf-8') as f:
         f.write(html_content)
+    print(f"✅ TXT 转 HTML: {file_name}")
 
 def export_google_doc(file_id, file_name):
     request = service.files().export_media(fileId=file_id, mimeType='text/html')
@@ -160,6 +161,7 @@ def export_google_doc(file_id, file_name):
     done = False
     while not done:
         _, done = downloader.next_chunk()
+    print(f"✅ Google Doc 导出 HTML: {file_name}")
 
 # ------------------------
 # 获取文件列表
@@ -280,4 +282,6 @@ if VERCEL_TOKEN and VERCEL_PROJECT_ID:
         json={"projectId": VERCEL_PROJECT_ID}
     )
     if r.status_code in [200,201]:
-        print("✅ V
+        print("✅ Vercel 部署触发成功")
+    else:
+        print(f"❌ Vercel 部署失败: {r.status_code}, {r.text}")
