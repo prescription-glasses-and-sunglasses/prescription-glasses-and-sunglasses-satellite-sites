@@ -53,7 +53,7 @@ jobs:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel --prod --token $VERCEL_TOKEN
+        run: vercel --prod --token $VERCEL_TOKEN --yes
 
       # 8️⃣ 部署到 Netlify
       - name: Deploy to Netlify
@@ -61,4 +61,5 @@ jobs:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_TOKEN }}
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
         run: netlify deploy --dir . --prod
+
 
