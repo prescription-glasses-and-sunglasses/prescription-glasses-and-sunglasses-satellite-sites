@@ -1,213 +1,250 @@
-# auto_deploy.py - 自动部署卫星站点到 Netlify 和 Vercel
 import os
-import sys
-import csv
-import time
 import json
+import sys
+import io
 import random
-import shutil
-import logging
-import subprocess
+import time
+import base64
+import re
 import requests
-from pathlib import Path
-from typing import List, Optional
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
-# -----------------------------
-# 日志配置
-# -----------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-# -----------------------------
+# ------------------------
 # 配置
-# -----------------------------
-CONFIG_FILE = Path("config.csv")
-ARTICLES_DIR = Path("articles")  # 存放 HTML 文章
-MAX_DEPLOY = 10                  # 每次部署的文章数
-REQUEST_TIMEOUT = 30             # API超时时间（秒）
+# ------------------------
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME")
+REPO_NAME = os.environ.get("GITHUB_REPO")  # 当前仓库名
+NETLIFY_TOKEN = os.environ.get("NETLIFY_TOKEN")
+VERCEL_TOKEN = os.environ.get("VERCEL_TOKEN")
+NETLIFY_SITE_ID = os.environ.get("NETLIFY_SITE_ID")
+VERCEL_PROJECT_ID = os.environ.get("VERCEL_PROJECT_ID")
 
+if not all([GITHUB_TOKEN, GITHUB_USERNAME, REPO_NAME]):
+    print("❌ 必须设置 GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO 环境变量")
+    sys.exit(1)
 
-class DeployManager:
-    def __init__(self):
-        self.config = self.load_config()
-        self.netlify_sites: List[str] = []
-        self.vercel_sites: List[str] = []
+GITHUB_API = "https://api.github.com"
 
-    def load_config(self) -> dict:
-        """加载配置文件"""
-        if not CONFIG_FILE.exists():
-            logger.error(f"配置文件 {CONFIG_FILE} 不存在")
-            sys.exit(1)
+# ------------------------
+# Google Drive 配置
+# ------------------------
+service_account_info = os.environ.get("GDRIVE_SERVICE_ACCOUNT")
+if not service_account_info:
+    print("❌ 未找到 GDRIVE_SERVICE_ACCOUNT 环境变量")
+    sys.exit(1)
+try:
+    service_account_info = json.loads(service_account_info)
+except json.JSONDecodeError:
+    print("❌ 解析 GDRIVE_SERVICE_ACCOUNT 失败")
+    sys.exit(1)
 
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            return next(reader)
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+creds = service_account.Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
+service = build('drive', 'v3', credentials=creds)
 
-    def get_random_articles(self, count: int) -> List[Path]:
-        """随机选取文章"""
-        if not ARTICLES_DIR.exists():
-            logger.error(f"文章目录 {ARTICLES_DIR} 不存在")
-            return []
+folder_ids_str = os.environ.get("GDRIVE_FOLDER_ID")
+if not folder_ids_str:
+    print("❌ 未找到 GDRIVE_FOLDER_ID 环境变量")
+    sys.exit(1)
+FOLDER_IDS = [fid.strip() for fid in folder_ids_str.split(",") if fid.strip()]
 
-        all_articles = list(ARTICLES_DIR.glob("*.html"))
-        if not all_articles:
-            logger.error(f"{ARTICLES_DIR} 没有找到 HTML 文章")
-            return []
+# ------------------------
+# 读取关键词
+# ------------------------
+keywords = []
+keywords_file = "keywords.txt"
+if os.path.exists(keywords_file):
+    with open(keywords_file, "r", encoding="utf-8") as f:
+        keywords = [line.strip() for line in f if line.strip()]
 
-        return random.sample(all_articles, min(count, len(all_articles)))
+# ------------------------
+# 已处理文件缓存
+# ------------------------
+processed_file_path = "processed_files.json"
+try:
+    if os.path.exists(processed_file_path):
+        with open(processed_file_path, "r") as f:
+            processed_data = json.load(f)
+    else:
+        processed_data = {"fileIds": []}
+except:
+    processed_data = {"fileIds": []}
 
-    def prepare_repo_content(self, repo_dir: Path, articles: List[Path]):
-        """准备临时仓库内容"""
-        repo_dir.mkdir(parents=True, exist_ok=True)
+# ------------------------
+# Google Drive 文件列表
+# ------------------------
+def list_files(folder_id):
+    all_files = []
+    page_token = None
+    query = f"'{folder_id}' in parents and (mimeType='text/html' or mimeType='text/plain' or mimeType='application/vnd.google-apps.document')"
+    while True:
+        results = service.files().list(q=query, pageSize=1000,
+                                       fields="nextPageToken, files(id, name, mimeType)", pageToken=page_token).execute()
+        items = results.get('files', [])
+        all_files.extend(items)
+        page_token = results.get('nextPageToken')
+        if not page_token:
+            break
+    return all_files
 
-        for article in articles:
-            shutil.copy2(article, repo_dir)
+# ------------------------
+# 下载文件函数
+# ------------------------
+def download_html_file(file_id):
+    request = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return fh.getvalue().decode('utf-8')
 
-        # 生成 index.html
-        index_content = """<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>文章列表</title>
-</head>
-<body>
-  <h1>文章列表</h1>
-  <ul>
-"""
-        for article in articles:
-            index_content += f'    <li><a href="{article.name}">{article.stem}</a></li>\n'
+def download_txt_file(file_id):
+    request = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    text = fh.getvalue().decode('utf-8')
+    html = f"<!DOCTYPE html><html><head><meta charset='utf-8'></head><body><pre>{text}</pre></body></html>"
+    return html
 
-        index_content += """  </ul>
-</body>
-</html>"""
+def export_google_doc(file_id):
+    request = service.files().export_media(fileId=file_id, mimeType='text/html')
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return fh.getvalue().decode('utf-8')
 
-        with open(repo_dir / "index.html", "w", encoding="utf-8") as f:
-            f.write(index_content)
+# ------------------------
+# GitHub API 上传文件
+# ------------------------
+def github_upload_file(path, content):
+    url = f"{GITHUB_API}/repos/{GITHUB_USERNAME}/{REPO_NAME}/contents/{path}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
-    def push_to_github(self, repo_name: str, repo_dir: Path) -> Optional[str]:
-        """上传内容到 GitHub"""
-        repo_url = f"https://{self.config['github_username']}:{self.config['github_token']}@github.com/{self.config['github_username']}/{repo_name}.git"
-        try:
-            os.chdir(repo_dir)
-            subprocess.run(["git", "init"], check=True)
-            subprocess.run(["git", "add", "."], check=True)
-            subprocess.run(["git", "commit", "-m", "Initial commit"], check=True)
-            subprocess.run(["git", "branch", "-M", "main"], check=True)
-            subprocess.run(["git", "remote", "add", "origin", repo_url], check=True)
-            subprocess.run(["git", "push", "-u", "origin", "main", "--force"], check=True)
-            os.chdir("..")
-            return f"https://github.com/{self.config['github_username']}/{repo_name}"
-        except Exception as e:
-            logger.error(f"推送 GitHub 出错: {e}")
-            os.chdir("..")
-            return None
+    # 检查文件是否存在
+    r = requests.get(url, headers=headers)
+    if r.status_code == 200:
+        sha = r.json()["sha"]
+        data = {
+            "message": f"Auto deploy {path}",
+            "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
+            "sha": sha,
+            "branch": "main"
+        }
+    else:
+        data = {
+            "message": f"Auto deploy {path}",
+            "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
+            "branch": "main"
+        }
 
-    def deploy_to_netlify(self, repo_url: str) -> Optional[str]:
-        """部署到 Netlify"""
-        try:
-            headers = {"Authorization": f"Bearer {self.config['netlify_token']}"}
-            data = {
-                "name": f"site-{int(time.time())}-{random.randint(1000,9999)}",
-                "repo": {
-                    "provider": "github",
-                    "repo": repo_url.replace("https://github.com/", ""),
-                    "branch": "main"
-                }
-            }
-            response = requests.post("https://api.netlify.com/api/v1/sites", headers=headers, json=data, timeout=REQUEST_TIMEOUT)
+    r = requests.put(url, headers=headers, json=data)
+    if r.status_code in [200, 201]:
+        print(f"✅ {path} 上传成功")
+    else:
+        print(f"❌ 上传 {path} 失败: {r.text}")
 
-            if response.status_code in [200, 201]:
-                site_url = response.json().get("url")
-                logger.info(f"成功部署到 Netlify: {site_url}")
-                return site_url
-            else:
-                logger.error(f"Netlify 部署失败: {response.text}")
-                return None
-        except Exception as e:
-            logger.error(f"Netlify 出错: {e}")
-            return None
+# ------------------------
+# Netlify / Vercel 部署
+# ------------------------
+def deploy_netlify():
+    if not NETLIFY_TOKEN or not NETLIFY_SITE_ID:
+        return
+    headers = {"Authorization": f"Bearer {NETLIFY_TOKEN}"}
+    r = requests.post(f"https://api.netlify.com/api/v1/sites/{NETLIFY_SITE_ID}/deploys", headers=headers)
+    print(f"Netlify 部署状态: {r.status_code}")
 
-    def deploy_to_vercel(self, repo_url: str) -> Optional[str]:
-        """部署到 Vercel"""
-        try:
-            headers = {"Authorization": f"Bearer {self.config['vercel_token']}"}
-            data = {
-                "name": f"site-{int(time.time())}-{random.randint(1000,9999)}",
-                "gitRepository": {"type": "github", "repo": repo_url.replace("https://github.com/", ""), "branch": "main"}
-            }
-            response = requests.post("https://api.vercel.com/v9/projects", headers=headers, json=data, timeout=REQUEST_TIMEOUT)
+def deploy_vercel():
+    if not VERCEL_TOKEN or not VERCEL_PROJECT_ID:
+        return
+    headers = {"Authorization": f"Bearer {VERCEL_TOKEN}"}
+    r = requests.post("https://api.vercel.com/v13/deployments", headers=headers, json={"project": VERCEL_PROJECT_ID})
+    print(f"Vercel 部署状态: {r.status_code}")
 
-            if response.status_code in [200, 201]:
-                project = response.json()
-                site_url = f"https://{project['name']}.vercel.app"
-                logger.info(f"成功部署到 Vercel: {site_url}")
-                return site_url
-            else:
-                logger.error(f"Vercel 部署失败: {response.text}")
-                return None
-        except Exception as e:
-            logger.error(f"Vercel 出错: {e}")
-            return None
+# ------------------------
+# 主程序
+# ------------------------
+all_files = []
+for fid in FOLDER_IDS:
+    all_files.extend(list_files(fid))
 
-    def generate_sitemap(self, output_file: Path):
-        """生成 sitemap.html"""
-        html = """<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>卫星站点地图</title></head>
-<body>
-  <h1>卫星站点地图</h1>
-  <p>生成时间: %s</p>
-  <h2>Netlify</h2><ul>""" % time.strftime("%Y-%m-%d %H:%M:%S")
+new_files = [f for f in all_files if f['id'] not in processed_data.get("fileIds", [])]
 
-        for url in self.netlify_sites:
-            html += f"<li><a href='{url}' target='_blank'>{url}</a></li>"
+# 处理文件
+for f in new_files:
+    base_name = f['name'].replace(" ", "-")
+    if f['mimeType'] == 'text/html':
+        html = download_html_file(f['id'])
+    elif f['mimeType'] == 'text/plain':
+        html = download_txt_file(f['id'])
+    else:
+        html = export_google_doc(f['id'])
+    processed_data["fileIds"].append(f['id'])
 
-        html += "</ul><h2>Vercel</h2><ul>"
+    # 上传 HTML 文件
+    github_upload_file(base_name, html)
 
-        for url in self.vercel_sites:
-            html += f"<li><a href='{url}' target='_blank'>{url}</a></li>"
+# 保存 processed 文件
+with open(processed_file_path, "w") as f:
+    json.dump(processed_data, f, indent=2)
 
-        html += "</ul></body></html>"
+# ------------------------
+# 生成 index.html（sitemap）
+# ------------------------
+all_html_files = [f['name'].replace(" ", "-") for f in all_files]
+index_html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Sitemap</title></head><body><h1>Sitemap</h1><ul>\n"
+for file in all_html_files:
+    index_html += f'<li><a href="{file}">{file}</a></li>\n'
+index_html += "</ul></body></html>"
 
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(html)
+github_upload_file("index.html", index_html)
 
-        logger.info(f"站点地图已生成: {output_file}")
+# ------------------------
+# 底部随机内部链接
+# ------------------------
+for f in all_html_files:
+    try:
+        # 获取内容
+        url = f"{GITHUB_API}/repos/{GITHUB_USERNAME}/{REPO_NAME}/contents/{f}"
+        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+        r = requests.get(url, headers=headers)
+        if r.status_code != 200:
+            continue
+        content_json = r.json()
+        html_content = base64.b64decode(content_json['content']).decode('utf-8')
 
-    def run(self):
-        """执行部署流程"""
-        articles = self.get_random_articles(MAX_DEPLOY)
-        if not articles:
-            logger.error("没有找到文章")
-            return False
+        # 移除旧 footer
+        html_content = re.sub(r"<footer>.*?</footer>", "", html_content, flags=re.DOTALL | re.IGNORECASE)
 
-        repo_name = f"satellite-{int(time.time())}"
-        temp_dir = Path("temp_repo")
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
+        # 添加随机内部链接
+        other_files = [x for x in all_html_files if x != f]
+        num_links = min(len(other_files), random.randint(4,6))
+        links_html = ""
+        if num_links > 0:
+            random_links = random.sample(other_files, num_links)
+            links_html = "<footer><ul>\n" + "\n".join([f'<li><a href="{x}">{x}</a></li>' for x in random_links]) + "\n</ul></footer>"
 
-        self.prepare_repo_content(temp_dir, articles)
-        github_url = self.push_to_github(repo_name, temp_dir)
-        shutil.rmtree(temp_dir)
+        # 确保 </body></html> 存在
+        html_content = re.sub(r"</body>\s*</html>.*$", "", html_content, flags=re.IGNORECASE)
+        html_content = html_content.strip() + "\n" + links_html + "</body></html>"
 
-        if not github_url:
-            logger.error("推送 GitHub 失败")
-            return False
+        # 上传更新后的 HTML
+        github_upload_file(f, html_content)
+    except Exception as e:
+        print(f"❌ 无法为 {f} 添加内部链接: {e}")
 
-        netlify_url = self.deploy_to_netlify(github_url)
-        if netlify_url:
-            self.netlify_sites.append(netlify_url)
+# ------------------------
+# 触发部署
+# ------------------------
+deploy_netlify()
+deploy_vercel()
 
-        vercel_url = self.deploy_to_vercel(github_url)
-        if vercel_url:
-            self.vercel_sites.append(vercel_url)
-
-        self.generate_sitemap(Path("sitemap.html"))
-        logger.info("部署完成")
-        return True
-
-
-if __name__ == "__main__":
-    deployer = DeployManager()
-    success = deployer.run()
-    sys.exit(0 if success else 1)
+print("✅ 部署完成！")
