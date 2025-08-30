@@ -1,4 +1,4 @@
-name: Auto Update HTML from Google Drive
+name: Auto Update HTML and Deploy
 
 # 手动触发 + 定时触发（每6小时一次）
 on:
@@ -7,10 +7,10 @@ on:
     - cron: "0 */6 * * *"
 
 jobs:
-  update-html:
+  deploy-sites:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # ⚡ 给 GITHUB_TOKEN 上传文件权限
+      contents: write # ⚡ 给予 GITHUB_TOKEN 上传文件权限
 
     steps:
       # 1️⃣ 检出仓库
@@ -28,31 +28,36 @@ jobs:
         run: |
           pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
 
-      # 4️⃣ 运行 auto_deploy.py（只处理文件）
-      - name: Run auto_deploy.py
+      # 4️⃣ 运行 Python 脚本生成文件
+      - name: Run auto_deploy.py to generate HTML files
         env:
-          # Google Drive 配置
           GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          # Netlify 部署（由 Python 脚本处理）
-          NETLIFY_TOKEN: ${{ secrets.NETLIFY_TOKEN }}
         run: python auto_deploy.py
-
-      # --- Vercel 部署步骤 ---
-      # 5️⃣ 安装 Node.js (Vercel CLI 需要)
+        
+      # 5️⃣ 安装 Node.js (Vercel 和 Netlify CLI 都需要)
       - name: Setup Node.js
         uses: actions/setup-node@v2
         with:
           node-version: '16'
 
-      # 6️⃣ 安装 Vercel CLI
-      - name: Install Vercel CLI
-        run: npm install --global vercel@latest
+      # 6️⃣ 安装 Vercel 和 Netlify CLI
+      - name: Install Deployment CLIs
+        run: |
+          npm install -g vercel@latest
+          npm install -g netlify-cli
 
       # 7️⃣ 部署到 Vercel
       - name: Deploy to Vercel
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: vercel --prod --token $VERCEL_TOKEN
+
+      # 8️⃣ 部署到 Netlify
+      - name: Deploy to Netlify
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+        run: netlify deploy --dir . --prod
