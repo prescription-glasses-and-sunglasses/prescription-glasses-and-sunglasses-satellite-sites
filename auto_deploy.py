@@ -259,11 +259,25 @@ for fname in html_files + ["index.html"]:
 NETLIFY_TOKEN = os.environ.get("NETLIFY_TOKEN")
 NETLIFY_SITE_ID = os.environ.get("NETLIFY_SITE_ID")
 if NETLIFY_TOKEN and NETLIFY_SITE_ID:
-    r = requests.post(f"https://api.netlify.com/api/v1/sites/{NETLIFY_SITE_ID}/builds",
-                      headers={"Authorization":f"Bearer {NETLIFY_TOKEN}"})
+    r = requests.post(
+        f"https://api.netlify.com/api/v1/sites/{NETLIFY_SITE_ID}/builds",
+        headers={"Authorization": f"Bearer {NETLIFY_TOKEN}"}
+    )
     if r.status_code==201:
         print("✅ Netlify 构建触发成功")
     else:
         print(f"❌ Netlify 构建失败: {r.text}")
 
-VERCEL_TOKEN = os.environ.get("
+VERCEL_TOKEN = os.environ.get("VERCEL_TOKEN")
+VERCEL_PROJECT_ID = os.environ.get("VERCEL_PROJECT_ID")
+if VERCEL_TOKEN and VERCEL_PROJECT_ID:
+    r = requests.post(
+        "https://api.vercel.com/v13/deployments",
+        headers={
+            "Authorization": f"Bearer {VERCEL_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        json={"projectId": VERCEL_PROJECT_ID}
+    )
+    if r.status_code in [200,201]:
+        print("✅ V
