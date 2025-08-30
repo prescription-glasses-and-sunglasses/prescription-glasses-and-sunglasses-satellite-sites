@@ -1,40 +1,853 @@
-# auto_deploy.py - 自动生成和部署卫星站点
+# auto_deploy.py - 自动部署卫星站点到 Netlify 和 Vercel
 import os
 import sys
 import random
-import shutil
 import json
 import csv
-import hashlib
-from pathlib import Path
 import subprocess
+import shutil
+from pathlib import Path
 import requests
 import time
-import re
-import string
-import io
-from dataclasses import dataclass
-import dataclasses
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional
 import logging
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from setup_github import GitHubSetup
 
 # -----------------------------
 # 日志配置
 # -----------------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-import requests
-import time
-import re
-from dataclasses import dataclass
-import dataclasses
-from typing import List, Dict, Optional, Set
-import logging
+
+# -----------------------------
+# 配置
+# -----------------------------
+CONFIG_FILE = Path("config.csv")
+ARTICLES_DIR = Path("articles")  # 文章存储目录
+MAX_DEPLOY_PER_PLATFORM = 10  # 每个平台最大部署文章数
+REQUEST_TIMEOUT = 30  # API请求超时时间（秒）
+
+class DeployManager:
+    def __init__(self):
+        self.config = self.load_config()
+        self.netlify_sites = []
+        self.vercel_sites = []
+        self.github_setup = GitHubSetup(self.config['github_token'], self.config['github_username'])
+
+    def load_config(self) -> dict:
+        """加载配置文件"""
+        if not CONFIG_FILE.exists():
+            logger.error(f"配置文件 {CONFIG_FILE} 不存在")
+            sys.exit(1)
+            
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            return next(reader)
+    
+    def get_random_articles(self, count: int) -> List[Path]:
+        """随机选择指定数量的文章"""
+        if not ARTICLES_DIR.exists():
+            logger.error(f"文章目录 {ARTICLES_DIR} 不存在")
+            return []
+            
+        all_articles = list(ARTICLES_DIR.glob("*.html"))
+        if not all_articles:
+            logger.error(f"在 {ARTICLES_DIR} 中没有找到任何HTML文章")
+            return []
+            
+        return random.sample(all_articles, min(count, len(all_articles)))
+
+    def deploy_to_netlify(self, repo_url: str, site_name: str = None) -> str:
+        """部署到 Netlify"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.config['netlify_token']}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "name": site_name or f"site-{int(time.time())}-{random.randint(1000, 9999)}",
+                "repo": {
+                    "provider": "github",
+                    "repo": repo_url,
+                    "private": True,
+                    "branch": "main"
+                }
+            }
+            
+            response = requests.post(
+                "https://api.netlify.com/api/v1/sites",
+                headers=headers,
+                json=data,
+                timeout=REQUEST_TIMEOUT
+            )
+            
+            if response.status_code in [200, 201]:
+                site_url = response.json().get("url")
+                if site_url:
+                    logger.info(f"成功部署到 Netlify: {site_url}")
+                    return site_url
+            
+            logger.error(f"Netlify 部署失败: {response.text}")
+            return None
+        except Exception as e:
+            logger.error(f"Netlify 部署出错: {e}")
+            return None
+
+    def deploy_to_vercel(self, repo_url: str, site_name: str = None) -> str:
+        """部署到 Vercel"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.config['vercel_token']}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "name": site_name or f"site-{int(time.time())}-{random.randint(1000, 9999)}",
+                "gitRepository": {
+                    "type": "github",
+                    "repo": repo_url,
+                    "private": True,
+                    "branch": "main"
+                }
+            }
+            
+            response = requests.post(
+                "https://api.vercel.com/v9/projects",
+                headers=headers,
+                json=data,
+                timeout=REQUEST_TIMEOUT
+            )
+            
+            if response.status_code in [200, 201]:
+                project = response.json()
+                site_url = f"https://{project['name']}.vercel.app"
+                logger.info(f"成功部署到 Vercel: {site_url}")
+                return site_url
+            
+            logger.error(f"Vercel 部署失败: {response.text}")
+            return None
+        except Exception as e:
+            logger.error(f"Vercel 部署出错: {e}")
+            return None
+
+    def run(self):
+        """运行部署流程"""
+        # 1. 随机选择文章
+        articles = self.get_random_articles(MAX_DEPLOY_PER_PLATFORM)
+        if not articles:
+            logger.error("没有找到可部署的文章")
+            return False
+
+        # 2. 创建新的 GitHub 仓库并部署到 Netlify 和 Vercel
+        repo_name = f"satellite-{int(time.time())}"
+        repo = self.github_setup.create_repo(repo_name, is_private=True)
+        if not repo:
+            logger.error("创建 GitHub 仓库失败")
+            return False
+
+        # 3. 准备并推送文件到 GitHub
+        temp_dir = Path(f"temp_{int(time.time())}")
+        temp_dir.mkdir(exist_ok=True)
+        try:
+            # 复制文章到临时目录
+            for article in articles:
+                shutil.copy2(article, temp_dir)
+            
+            # 添加 index.html
+            self.create_index_html(temp_dir, articles)
+            
+            # 推送到 GitHub
+            os.chdir(temp_dir)
+            subprocess.run(["git", "init"], check=True)
+            subprocess.run(["git", "add", "."], check=True)
+            subprocess.run(["git", "commit", "-m", "Initial commit"], check=True)
+            subprocess.run(["git", "branch", "-M", "main"], check=True)
+            
+            repo_url = f"https://{self.config['github_username']}:{self.config['github_token']}@github.com/{self.config['github_username']}/{repo_name}.git"
+            subprocess.run(["git", "remote", "add", "origin", repo_url], check=True)
+            subprocess.run(["git", "push", "-u", "origin", "main", "--force"], check=True)
+            
+            # 返回工作目录并清理临时文件
+            os.chdir("..")
+            shutil.rmtree(temp_dir)
+            
+            # 4. 部署到 Netlify 和 Vercel
+            github_repo = f"{self.config['github_username']}/{repo_name}"
+            
+            netlify_url = self.deploy_to_netlify(github_repo)
+            if netlify_url:
+                self.netlify_sites.append(netlify_url)
+            
+            vercel_url = self.deploy_to_vercel(github_repo)
+            if vercel_url:
+                self.vercel_sites.append(vercel_url)
+            
+            logger.info(f"部署完成：")
+            logger.info(f"- Netlify 站点: {len(self.netlify_sites)} 个")
+            logger.info(f"- Vercel 站点: {len(self.vercel_sites)} 个")
+            
+            # 5. 生成站点地图
+            sitemap_file = Path("sitemap.html")
+            generate_sitemap(self.netlify_sites, self.vercel_sites, sitemap_file)
+            logger.info(f"站点地图已生成: {sitemap_file}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"部署过程出错: {e}")
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+            return False
+
+    def create_index_html(self, directory: Path, articles: List[Path]):
+        """创建索引页面"""
+        index_content = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>文章列表</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        ul { list-style-type: none; padding: 0; }
+        li { margin: 10px 0; }
+        a { color: #0066cc; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <h1>文章列表</h1>
+    <ul>
+"""
+        for article in articles:
+            index_content += f'        <li><a href="{article.name}">{article.stem}</a></li>\n'
+        
+        index_content += """    </ul>
+</body>
+</html>"""
+        
+        with open(directory / "index.html", "w", encoding="utf-8") as f:
+            f.write(index_content)
+
+def generate_sitemap(netlify_urls: List[str], vercel_urls: List[str], output_file: Path):
+    """生成站点地图"""
+    try:
+        html_content = f"""<!DOCTYPE html>
+<html lang='zh-CN'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>卫星站点地图</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+        .site-group {{ margin-bottom: 20px; }}
+        .site-group h2 {{ color: #333; border-bottom: 2px solid #eee; }}
+        ul {{ list-style-type: none; padding: 0; }}
+        li {{ margin: 5px 0; }}
+        a {{ text-decoration: none; color: #0066cc; }}
+        a:hover {{ text-decoration: underline; }}
+    </style>
+</head>
+<body>
+    <h1>卫星站点地图</h1>
+    <p>生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
+    
+    <div class="site-group">
+        <h2>Netlify 站点 ({len(netlify_urls)}个)</h2>
+        <ul>
+"""
+        for url in netlify_urls:
+            html_content += f"            <li><a href='{url}' target='_blank'>{url}</a></li>\n"
+        
+        html_content += f"""        </ul>
+    </div>
+    
+    <div class="site-group">
+        <h2>Vercel 站点 ({len(vercel_urls)}个)</h2>
+        <ul>
+"""
+        for url in vercel_urls:
+            html_content += f"            <li><a href='{url}' target='_blank'>{url}</a></li>\n"
+        
+        html_content += """        </ul>
+    </div>
+</body>
+</html>"""
+        
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        logger.info(f"站点地图已生成: {output_file}")
+    except Exception as e:
+        logger.error(f"生成站点地图时出错: {e}")
+
+if __name__ == "__main__":
+    try:
+        deployer = DeployManager()
+        deployer.run()
+    except Exception as e:
+        logger.error(f"执行过程出错: {e}")
+        sys.exit(1)return []
+            
+        all_articles = list(ARTICLES_DIR.glob("*.html"))
+        if not all_articles:
+            logger.error(f"在 {ARTICLES_DIR} 中没有找到任何HTML文章")
+            return []
+            
+        return random.sample(all_articles, min(count, len(all_articles)))
+
+    def deploy_to_netlify(self, repo_url: str, site_name: str = None) -> str:
+        """部署到 Netlify"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.config['netlify_token']}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "name": site_name or f"site-{int(time.time())}-{random.randint(1000, 9999)}",
+                "repo": {
+                    "provider": "github",
+                    "repo": repo_url,
+                    "private": True,
+                    "branch": "main"
+                }
+            }
+            
+            response = requests.post(
+                "https://api.netlify.com/api/v1/sites",
+                headers=headers,
+                json=data
+            )
+            
+            if response.status_code in [200, 201]:
+                site_url = response.json().get("url")
+                if site_url:
+                    logger.info(f"成功部署到 Netlify: {site_url}")
+                    return site_url
+            
+            logger.error(f"Netlify 部署失败: {response.text}")
+            return None
+        except Exception as e:
+            logger.error(f"Netlify 部署出错: {e}")
+            return None
+
+    def deploy_to_vercel(self, repo_url: str, site_name: str = None) -> str:
+        """部署到 Vercel"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.config['vercel_token']}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "name": site_name or f"site-{int(time.time())}-{random.randint(1000, 9999)}",
+                "gitRepository": {
+                    "type": "github",
+                    "repo": repo_url,
+                    "private": True,
+                    "branch": "main"
+                }
+            }
+            
+            response = requests.post(
+                "https://api.vercel.com/v9/projects",
+                headers=headers,
+                json=data
+            )
+            
+            if response.status_code in [200, 201]:
+                project = response.json()
+                site_url = f"https://{project['name']}.vercel.app"
+                logger.info(f"成功部署到 Vercel: {site_url}")
+                return site_url
+            
+            logger.error(f"Vercel 部署失败: {response.text}")
+            return None
+        except Exception as e:
+            logger.error(f"Vercel 部署出错: {e}")
+            return None
+
+    def run(self):
+        """运行部署流程"""
+        # 1. 随机选择文章
+        articles = self.get_random_articles(MAX_DEPLOY_PER_PLATFORM)
+        if not articles:
+            logger.error("没有找到可部署的文章")
+            return False
+
+        # 2. 创建新的 GitHub 仓库并部署到 Netlify 和 Vercel
+        repo_name = f"satellite-{int(time.time())}"
+        repo = self.github_setup.create_repo(repo_name, is_private=True)
+        if not repo:
+            logger.error("创建 GitHub 仓库失败")
+            return False
+
+        # 3. 准备并推送文件到 GitHub
+        temp_dir = Path(f"temp_{int(time.time())}")
+        temp_dir.mkdir(exist_ok=True)
+        try:
+            # 复制文章到临时目录
+            for article in articles:
+                shutil.copy2(article, temp_dir)
+            
+            # 添加 index.html
+            self.create_index_html(temp_dir, articles)
+            
+            # 推送到 GitHub
+            os.chdir(temp_dir)
+            subprocess.run(["git", "init"], check=True)
+            subprocess.run(["git", "add", "."], check=True)
+            subprocess.run(["git", "commit", "-m", "Initial commit"], check=True)
+            subprocess.run(["git", "branch", "-M", "main"], check=True)
+            
+            repo_url = f"https://{self.config['github_username']}:{self.config['github_token']}@github.com/{self.config['github_username']}/{repo_name}.git"
+            subprocess.run(["git", "remote", "add", "origin", repo_url], check=True)
+            subprocess.run(["git", "push", "-u", "origin", "main", "--force"], check=True)
+            
+            # 返回工作目录并清理临时文件
+            os.chdir("..")
+            shutil.rmtree(temp_dir)
+            
+            # 4. 部署到 Netlify 和 Vercel
+            github_repo = f"{self.config['github_username']}/{repo_name}"
+            
+            netlify_url = self.deploy_to_netlify(github_repo)
+            if netlify_url:
+                self.netlify_sites.append(netlify_url)
+            
+            vercel_url = self.deploy_to_vercel(github_repo)
+            if vercel_url:
+                self.vercel_sites.append(vercel_url)
+            
+            logger.info(f"部署完成：")
+            logger.info(f"- Netlify 站点: {len(self.netlify_sites)} 个")
+            logger.info(f"- Vercel 站点: {len(self.vercel_sites)} 个")
+            
+            # 5. 生成站点地图
+            sitemap_file = Path("sitemap.html")
+            generate_sitemap(self.netlify_sites, self.vercel_sites, sitemap_file)
+            logger.info(f"站点地图已生成: {sitemap_file}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"部署过程出错: {e}")
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+            return False
+
+    def create_index_html(self, directory: Path, articles: List[Path]):
+        """创建索引页面"""
+        index_content = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>文章列表</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        ul { list-style-type: none; padding: 0; }
+        li { margin: 10px 0; }
+        a { color: #0066cc; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <h1>文章列表</h1>
+    <ul>
+"""
+        for article in articles:
+            index_content += f'        <li><a href="{article.name}">{article.stem}</a></li>\n'
+        
+        index_content += """    </ul>
+</body>
+</html>"""
+        
+        with open(directory / "index.html", "w", encoding="utf-8") as f:
+            f.write(index_content)
+
+def generate_sitemap(netlify_urls: List[str], vercel_urls: List[str], output_file: Path):
+    """生成站点地图"""
+    try:
+        html_content = f"""<!DOCTYPE html>
+<html lang='zh-CN'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>卫星站点地图</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+        .site-group {{ margin-bottom: 20px; }}
+        .site-group h2 {{ color: #333; border-bottom: 2px solid #eee; }}
+        ul {{ list-style-type: none; padding: 0; }}
+        li {{ margin: 5px 0; }}
+        a {{ text-decoration: none; color: #0066cc; }}
+        a:hover {{ text-decoration: underline; }}
+    </style>
+</head>
+<body>
+    <h1>卫星站点地图</h1>
+    <p>生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
+    
+    <div class="site-group">
+        <h2>Netlify 站点 ({len(netlify_urls)}个)</h2>
+        <ul>
+"""
+        for url in netlify_urls:
+            html_content += f"            <li><a href='{url}' target='_blank'>{url}</a></li>\n"
+        
+        html_content += f"""        </ul>
+    </div>
+    
+    <div class="site-group">
+        <h2>Vercel 站点 ({len(vercel_urls)}个)</h2>
+        <ul>
+"""
+        for url in vercel_urls:
+            html_content += f"            <li><a href='{url}' target='_blank'>{url}</a></li>\n"
+        
+        html_content += """        </ul>
+    </div>
+</body>
+</html>"""
+        
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        logger.info(f"站点地图已生成: {output_file}")
+    except Exception as e:
+        logger.error(f"生成站点地图时出错: {e}")
+
+if __name__ == "__main__":
+    try:
+        deployer = DeployManager()
+        deployer.run()
+    except Exception as e:
+        logger.error(f"执行过程出错: {e}")
+        sys.exit(1)
+
+# -----------------------------
+# 配置
+# -----------------------------
+CONFIG_FILE = Path("config.csv")
+ARTICLES_DIR = Path("articles")  # 文章存储目录
+MAX_DEPLOY_PER_PLATFORM = 10  # 每个平台最大部署文章数
+
+class DeployManager:
+    def __init__(self):
+        self.config = self.load_config()
+        self.github_pages_url = None
+        self.netlify_sites = []
+        self.vercel_sites = []
+
+    def load_config(self) -> dict:
+        """加载配置文件"""
+        if not CONFIG_FILE.exists():
+            logger.error(f"配置文件 {CONFIG_FILE} 不存在")
+            sys.exit(1)
+            
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            return next(reader)
+    
+    def get_random_articles(self, count: int) -> List[Path]:
+        """随机选择指定数量的文章"""
+        if not ARTICLES_DIR.exists():
+            logger.error(f"文章目录 {ARTICLES_DIR} 不存在")
+            return []
+            
+        all_articles = list(ARTICLES_DIR.glob("*.html"))
+        if not all_articles:
+            logger.error(f"在 {ARTICLES_DIR} 中没有找到任何HTML文章")
+            return []
+            
+        return random.sample(all_articles, min(count, len(all_articles)))
+
+    def deploy_to_netlify(self, repo_url: str, site_name: str = None) -> str:
+        """部署到 Netlify"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.config['netlify_token']}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "name": site_name or f"site-{int(time.time())}-{random.randint(1000, 9999)}",
+                "repo": {
+                    "provider": "github",
+                    "repo": repo_url,
+                    "private": True,
+                    "branch": "main"
+                }
+            }
+            
+            response = requests.post(
+                "https://api.netlify.com/api/v1/sites",
+                headers=headers,
+                json=data
+            )
+            
+            if response.status_code in [200, 201]:
+                site_url = response.json().get("url")
+                if site_url:
+                    logger.info(f"成功部署到 Netlify: {site_url}")
+                    return site_url
+            
+            logger.error(f"Netlify 部署失败: {response.text}")
+            return None
+        except Exception as e:
+            logger.error(f"Netlify 部署出错: {e}")
+            return None
+
+    def deploy_to_vercel(self, repo_url: str, site_name: str = None) -> str:
+        """部署到 Vercel"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.config['vercel_token']}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "name": site_name or f"site-{int(time.time())}-{random.randint(1000, 9999)}",
+                "gitRepository": {
+                    "type": "github",
+                    "repo": repo_url,
+                    "private": True,
+                    "branch": "main"
+                }
+            }
+            
+            response = requests.post(
+                "https://api.vercel.com/v9/projects",
+                headers=headers,
+                json=data
+            )
+            
+            if response.status_code in [200, 201]:
+                project = response.json()
+                site_url = f"https://{project['name']}.vercel.app"
+                logger.info(f"成功部署到 Vercel: {site_url}")
+                return site_url
+            
+            logger.error(f"Vercel 部署失败: {response.text}")
+            return None
+        except Exception as e:
+            logger.error(f"Vercel 部署出错: {e}")
+            return None
+
+    def push_to_github(self, articles: List[Path], repo_name: str) -> str:
+        """推送文章到 GitHub 仓库"""
+        try:
+            # 创建临时目录
+            temp_dir = Path(f"temp_{int(time.time())}")
+            temp_dir.mkdir(exist_ok=True)
+            
+            # 复制文章到临时目录
+            for article in articles:
+                shutil.copy2(article, temp_dir)
+            
+            # 初始化 git 仓库
+            repo_url = f"https://{self.config['github_token']}@github.com/{self.config['github_username']}/{repo_name}.git"
+            os.chdir(temp_dir)
+            
+            subprocess.run(["git", "init"], check=True)
+            subprocess.run(["git", "add", "."], check=True)
+            subprocess.run(["git", "commit", "-m", "Initial commit"], check=True)
+            subprocess.run(["git", "branch", "-M", "main"], check=True)
+            subprocess.run(["git", "remote", "add", "origin", repo_url], check=True)
+            subprocess.run(["git", "push", "-u", "origin", "main", "--force"], check=True)
+            
+            # 清理
+            os.chdir("..")
+            shutil.rmtree(temp_dir)
+            
+            return f"https://github.com/{self.config['github_username']}/{repo_name}"
+        except Exception as e:
+            logger.error(f"GitHub 推送出错: {e}")
+            return None
+
+    def run(self):
+        """运行部署流程"""
+        # 1. 随机选择文章
+        articles = self.get_random_articles(MAX_DEPLOY_PER_PLATFORM)
+        if not articles:
+            logger.error("没有找到可部署的文章")
+            return False
+
+        # 2. 推送到 GitHub 并部署到 Netlify 和 Vercel
+        repo_name = f"satellite-{int(time.time())}"
+        github_url = self.push_to_github(articles, repo_name)
+        
+        if github_url:
+            # 部署到 Netlify
+            netlify_url = self.deploy_to_netlify(github_url)
+            if netlify_url:
+                self.netlify_sites.append(netlify_url)
+            
+            # 部署到 Vercel
+            vercel_url = self.deploy_to_vercel(github_url)
+            if vercel_url:
+                self.vercel_sites.append(vercel_url)
+            
+            logger.info(f"部署完成：")
+            logger.info(f"- Netlify 站点: {len(self.netlify_sites)} 个")
+            logger.info(f"- Vercel 站点: {len(self.vercel_sites)} 个")
+            return True
+        
+        return False
+
+# -----------------------------
+# 主函数
+# -----------------------------
+def main():
+    """主函数"""
+    try:
+        # 初始化部署管理器
+        deployer = DeployManager()
+        success = deployer.run()
+        
+        if success:
+            # 生成站点地图
+            sitemap_file = Path("sitemap.html")
+            generate_sitemap(deployer.netlify_sites, deployer.vercel_sites, sitemap_file)
+            logger.info("部署和站点地图生成完成")
+        else:
+            logger.error("部署过程失败")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"执行过程出错: {e}")
+        sys.exit(1)
+
+def generate_sitemap(netlify_urls: List[str], vercel_urls: List[str], output_file: Path):
+    """生成站点地图"""
+    try:
+        html_content = f"""<!DOCTYPE html>
+<html lang='zh-CN'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>卫星站点地图</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+        .site-group {{ margin-bottom: 20px; }}
+        .site-group h2 {{ color: #333; border-bottom: 2px solid #eee; }}
+        ul {{ list-style-type: none; padding: 0; }}
+        li {{ margin: 5px 0; }}
+        a {{ text-decoration: none; color: #0066cc; }}
+        a:hover {{ text-decoration: underline; }}
+    </style>
+</head>
+<body>
+    <h1>卫星站点地图</h1>
+    <p>生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
+    
+    <div class="site-group">
+        <h2>Netlify 站点 ({len(netlify_urls)}个)</h2>
+        <ul>
+"""
+        for url in netlify_urls:
+            html_content += f"            <li><a href='{url}' target='_blank'>{url}</a></li>\n"
+        
+        html_content += f"""        </ul>
+    </div>
+    
+    <div class="site-group">
+        <h2>Vercel 站点 ({len(vercel_urls)}个)</h2>
+        <ul>
+"""
+        for url in vercel_urls:
+            html_content += f"            <li><a href='{url}' target='_blank'>{url}</a></li>\n"
+        
+        html_content += """        </ul>
+    </div>
+</body>
+</html>"""
+        
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        logger.info(f"站点地图已生成: {output_file}")
+    except Exception as e:
+        logger.error(f"生成站点地图时出错: {e}")
+
+if __name__ == "__main__":
+    main()
+    
+    def get_random_articles(self, count: int) -> List[Path]:
+        """随机选择指定数量的文章"""
+        if not ARTICLES_DIR.exists():
+            logger.error(f"文章目录 {ARTICLES_DIR} 不存在")
+            return []
+            
+        all_articles = list(ARTICLES_DIR.glob("*.html"))
+        return random.sample(all_articles, min(count, len(all_articles)))
+    
+    def deploy_to_netlify(self, articles: List[Path]) -> bool:
+        """部署文章到 Netlify"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.config['netlify_token']}",
+                "Content-Type": "application/json"
+            }
+            # 部署逻辑这里实现
+            logger.info(f"已将 {len(articles)} 篇文章部署到 Netlify")
+            return True
+        except Exception as e:
+            logger.error(f"Netlify 部署失败: {e}")
+            return False
+    
+    def deploy_to_vercel(self, articles: List[Path]) -> bool:
+        """部署文章到 Vercel"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.config['vercel_token']}",
+                "Content-Type": "application/json"
+            }
+            # 部署逻辑这里实现
+            logger.info(f"已将 {len(articles)} 篇文章部署到 Vercel")
+            return True
+        except Exception as e:
+            logger.error(f"Vercel 部署失败: {e}")
+            return False
+    
+    def update_github_pages(self) -> bool:
+        """更新 GitHub Pages 内容"""
+        try:
+            repo_name = f"{self.config['repo_prefix']}-satellite-sites"
+            repo_url = f"https://{self.config['github_token']}@github.com/{self.config['github_username']}/{repo_name}.git"
+            
+            # Git 操作
+            subprocess.run(["git", "add", "."], check=True)
+            subprocess.run(["git", "commit", "-m", f"Update content {int(time.time())}"], check=True)
+            subprocess.run(["git", "push", "-u", "origin", "main", "--force"], check=True)
+            
+            logger.info("GitHub Pages 更新成功")
+            return True
+        except Exception as e:
+            logger.error(f"GitHub Pages 更新失败: {e}")
+            return False
+    
+    def run(self):
+        """执行部署流程"""
+        # 1. 更新 GitHub Pages
+        if self.update_github_pages():
+            self.deploy_history["github_pages"].append(int(time.time()))
+        
+        # 2. 随机选择文章部署到 Netlify 和 Vercel
+        articles = self.get_random_articles(MAX_DEPLOY_PER_PLATFORM)
+        if articles:
+            if self.deploy_to_netlify(articles):
+                self.deploy_history["netlify"].extend([a.name for a in articles])
+            if self.deploy_to_vercel(articles):
+                self.deploy_history["vercel"].extend([a.name for a in articles])
+        
+        # 3. 保存部署历史
+        self.save_deploy_history()
+
+def main():
+    """主函数"""
+    try:
+        deployer = DeployManager()
+        deployer.run()
+    except Exception as e:
+        logger.error(f"部署过程出错: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
 
 # -----------------------------
 # 日志配置
@@ -45,26 +858,9 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 # 配置区
 # -----------------------------
-@dataclass
-class PlatformConfig:
-    # 必需的认证信息
-    github_token: str          # GitHub Personal Access Token
-    github_username: str       # GitHub 用户名
-    netlify_token: str        # Netlify 认证令牌
-    vercel_token: str         # Vercel 认证令牌
-    gdrive_folder_id: str     # Google Drive 文件夹 ID
-    gdrive_service_account: str  # Google Drive 服务账号 JSON
-    
-    # 可选配置，带默认值
-    repo_prefix: str = "satellite"       # GitHub 仓库名称前缀
-    satellite_count: int = 10            # 卫星站点数量
-    processed_files_path: str = "processed_files.json"  # 已处理文件记录路径
-
+# 从 setup_github.py 获取基本配置
 CONFIG_FILE = Path("config.csv")
-GDRIVE_CONFIG_FILE = Path("gdrive_config.txt")  # Google Drive 配置文件
 CROSS_PLATFORM_LINKS_FILE = "cross_platform_links.txt"  # 可选跨平台链轮 TXT
-PROCESSED_FILES_PATH = Path("processed_files.json")  # 记录已处理的文件
-CACHE_FILE_PATH = Path("files_cache.json")  # Google Drive 文件列表缓存
 
 # 缓存配置
 CACHE_DIR = Path(".cache")  # 缓存目录
@@ -79,48 +875,8 @@ MAX_RETRIES = 3  # API请求最大重试次数
 CACHE_DIR.mkdir(exist_ok=True)
 
 # -----------------------------
-# Google Drive 文件处理
+# 平台部署处理
 # -----------------------------
-def get_google_drive_service():
-    """初始化 Google Drive service"""
-    try:
-        from google.oauth2 import service_account
-        
-        # 首先尝试从环境变量获取服务账号信息
-        service_account_info = os.environ.get('GDRIVE_SERVICE_ACCOUNT')
-        if service_account_info:
-            try:
-                credentials_info = json.loads(service_account_info)
-                credentials = service_account.Credentials.from_service_account_info(
-                    credentials_info,
-                    scopes=['https://www.googleapis.com/auth/drive.readonly']
-                )
-                logger.info("使用环境变量中的服务账号凭据")
-                return build('drive', 'v3', credentials=credentials)
-            except json.JSONDecodeError:
-                logger.warning("环境变量 GDRIVE_SERVICE_ACCOUNT 格式不正确，尝试从文件读取")
-        
-        # 如果环境变量不存在或无效，尝试从文件读取
-        if os.path.exists('service-account.json'):
-            try:
-                credentials = service_account.Credentials.from_service_account_file(
-                    'service-account.json',
-                    scopes=['https://www.googleapis.com/auth/drive.readonly']
-                )
-                logger.info("使用本地 service-account.json 文件的服务账号凭据")
-                return build('drive', 'v3', credentials=credentials)
-            except Exception as e:
-                logger.error(f"读取 service-account.json 文件失败: {e}")
-        
-        logger.error("未找到有效的服务账号凭据，请确保设置了环境变量 GDRIVE_SERVICE_ACCOUNT 或提供了 service-account.json 文件")
-        return None
-        return build('drive', 'v3', credentials=credentials)
-    except Exception as e:
-        logger.error(f"初始化 Google Drive service 失败: {e}")
-        return None
-
-# 初始化 Google Drive service
-service = get_google_drive_service()
 def get_drive_files(folder_id: str) -> List[Dict]:
     """从 Google Drive 获取指定文件夹中的所有文件"""
     all_files = []
@@ -345,37 +1101,17 @@ def create_example_config():
         logger.info("请编辑配置文件并填入正确的token和用户名")
         sys.exit(1)
 
-def load_platform_config() -> PlatformConfig:
-    """加载平台配置"""
+def load_platform_config() -> dict:
+    """从config.csv加载平台配置"""
     try:
-        # 优先从环境变量获取配置
-        config_dict = {
-            'github_token': os.getenv('GITHUB_TOKEN', ''),
-            'github_username': os.getenv('GITHUB_USERNAME', ''),
-            'netlify_token': os.getenv('NETLIFY_TOKEN', ''),
-            'vercel_token': os.getenv('VERCEL_TOKEN', ''),
-            'gdrive_folder_id': os.getenv('GDRIVE_FOLDER_ID', ''),
-            'gdrive_service_account': os.getenv('GDRIVE_SERVICE_ACCOUNT', ''),
-            'repo_prefix': os.getenv('REPO_PREFIX', 'satellite'),
-            'satellite_count': int(os.getenv('SATELLITE_COUNT', '10')),
-            'processed_files_path': os.getenv('PROCESSED_FILES_PATH', 'processed_files.json')
-        }
-        
-        # 如果配置文件存在，用其补充缺失的配置
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
-                file_config = next(reader)
-                
-                # 只更新环境变量中没有的值
-                for key in config_dict:
-                    if not config_dict[key] and key in file_config:
-                        if key == 'satellite_count':
-                            config_dict[key] = int(file_config[key])
-                        else:
-                            config_dict[key] = file_config[key]
-        
-        return PlatformConfig(**config_dict)
+                config = next(reader)
+                return config
+        else:
+            logger.error(f"配置文件 {CONFIG_FILE} 不存在")
+            return None
         
     except Exception as e:
         logger.error(f"加载配置时出错: {e}")
@@ -826,82 +1562,7 @@ def generate_repo_name(prefix: str) -> str:
     return f"{prefix}_{random_str}"
 
 # -----------------------------
-# Helper: Git操作
-# -----------------------------
-def create_github_repo(repo_name: str) -> Optional[str]:
-    """创建GitHub仓库"""
-    if not GITHUB_TOKEN:
-        logger.error("GitHub token not found")
-        return None
-
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    data = {
-        "name": repo_name,
-        "private": True,  # 设置为私有仓库
-        "auto_init": False
-    }
-    
-    url = "https://api.github.com/user/repos"
-    result = make_api_request(url, headers, data)
-    
-    if result:
-        logger.info(f"Created GitHub repository: {repo_name}")
-        return result.get("clone_url")
-    return None
-
-def git_push(repo_path: Path, repo_url: str) -> bool:
-    """Git推送操作"""
-    cwd = os.getcwd()
-    try:
-        os.chdir(repo_path)
-        
-        # 设置Git凭证
-        repo_url_with_token = repo_url.replace(
-            "https://", f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN}@"
-        )
-        
-        # 检查是否已经是git仓库
-        if not (repo_path / ".git").exists():
-            subprocess.run(["git", "init"], check=True, capture_output=True)
-            subprocess.run(["git", "branch", "-M", "main"], check=True, capture_output=True)
-        
-        subprocess.run(["git", "add", "."], check=True, capture_output=True)
-        
-        # 检查是否有变更
-        result = subprocess.run(["git", "diff", "--cached", "--quiet"], capture_output=True)
-        if result.returncode == 0:
-            logger.info("No changes to commit")
-            return True
-            
-        subprocess.run(["git", "commit", "-m", f"Update content {int(time.time())}"], 
-                      check=True, capture_output=True)
-        
-        # 设置remote
-        subprocess.run(["git", "remote", "remove", "origin"], 
-                      capture_output=True, text=True, check=False)
-        subprocess.run(["git", "remote", "add", "origin", repo_url_with_token], 
-                      check=True, capture_output=True)
-        
-        subprocess.run(["git", "push", "-u", "origin", "main", "--force"], 
-                      check=True, capture_output=True)
-        logger.info(f"Successfully pushed to {repo_url}")
-        return True
-        
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Git command failed: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"Git push failed: {e}")
-        return False
-    finally:
-        os.chdir(cwd)
-
-# -----------------------------
-# Helper: 创建仓库内容
+# 主函数执行
 # -----------------------------
 def create_repo_with_content(repo_name: str, articles: List[Dict[str, str]], cross_links: List[str]) -> Optional[str]:
     """创建仓库并添加内容"""
