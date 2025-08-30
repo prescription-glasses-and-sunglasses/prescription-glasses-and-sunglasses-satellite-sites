@@ -1,0 +1,15 @@
+# 忽略配置文件
+config.csv
+*.csv
+
+# 忽略Python相关文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 忽略环境相关文件
+.env
+.venv
+env/
+venv/
+ENV/
