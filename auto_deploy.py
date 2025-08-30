@@ -48,11 +48,15 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PlatformConfig:
     netlify_token: str
+    github_username: str
+    processed_files_path: str = "processed_files.json"
     vercel_token: str
     github_token: str      # GitHub Personal Access Token
     github_username: str
     satellite_count: int
     repo_prefix: str       # GitHub仓库名称前缀
+    gdrive_folder_id: str  # Google Drive文件夹ID
+    gdrive_service_account: str  # Google Drive服务账号JSON
 
 CONFIG_FILE = Path("config.csv")
 GDRIVE_CONFIG_FILE = Path("gdrive_config.txt")  # Google Drive 配置文件
@@ -204,7 +208,8 @@ def create_example_config():
         with open(CONFIG_FILE, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             # 写入表头
-            writer.writerow(['netlify_token', 'vercel_token', 'github_token', 'github_username', 'satellite_count', 'repo_prefix', 'gdrive_folder_ids'])
+            writer.writerow(['netlify_token', 'vercel_token', 'github_token', 'github_username', 
+                           'satellite_count', 'repo_prefix', 'gdrive_folder_id', 'gdrive_service_account'])
             # 写入示例数据
             writer.writerow([
                 'your_netlify_token',          # Netlify API Token
@@ -213,7 +218,8 @@ def create_example_config():
                 'your_github_username',        # GitHub用户名
                 '10',                          # 要创建的卫星站数量
                 'mysite',                      # 仓库名称前缀
-                'folder_id1,folder_id2'        # Google Drive 文件夹ID，多个用逗号分隔
+                'your_gdrive_folder_id',       # Google Drive 文件夹ID
+                '{}'                           # Google Drive 服务账号 JSON
             ])
         
         # 打印配置说明
@@ -244,7 +250,9 @@ def load_platform_config() -> PlatformConfig:
                     github_token=config['github_token'],
                     github_username=config['github_username'],
                     satellite_count=int(config['satellite_count']),
-                    repo_prefix=config['repo_prefix']
+                    repo_prefix=config['repo_prefix'],
+                    gdrive_folder_id=config['gdrive_folder_id'],
+                    gdrive_service_account=config['gdrive_service_account']
                 )
         except Exception as e:
             logger.error(f"读取配置文件出错: {e}")
@@ -434,25 +442,40 @@ def get_drive_content(file_id: str, mime_type: str) -> Optional[str]:
         logger.error(f"获取文件 {file_id} 内容时出错: {e}")
         return None
 
+def distribute_articles(all_articles: List[Dict[str, str]], new_articles: List[Dict[str, str]]) -> Dict[str, List[Dict[str, str]]]:
+    """将文章分配给不同的平台
+    Args:
+        all_articles: 所有文章列表
+        new_articles: 新增的文章列表
+    Returns:
+        包含每个平台要发布的文章的字典
+    """
+    # GitHub Pages 只需要新增的文章
+    github_articles = new_articles
+    
+    # Netlify 和 Vercel 各自从所有文章中随机选择10篇
+    article_count = min(10, len(all_articles))
+    netlify_articles = random.sample(all_articles, article_count)
+    vercel_articles = random.sample(all_articles, article_count)
+    
+    return {
+        'github': github_articles,
+        'netlify': netlify_articles,
+        'vercel': vercel_articles
+    }
+
 def load_articles_from_drive() -> List[Dict[str, str]]:
     """从 Google Drive 获取文章内容"""
     # 从环境变量获取 Google Drive 文件夹 ID
-    folder_ids_str = os.environ.get("GDRIVE_FOLDER_ID")
-    if not folder_ids_str:
+    folder_id = os.environ.get("GDRIVE_FOLDER_ID")
+    if not folder_id:
         logger.error("未找到 GDRIVE_FOLDER_ID 环境变量")
         return []
     
-    folder_ids = [fid.strip() for fid in folder_ids_str.split(",") if fid.strip()]
-    
-    # 加载已处理的文件记录
-    processed_files = set()
-    if PROCESSED_FILES_PATH.exists():
-        try:
-            with open(PROCESSED_FILES_PATH, "r") as f:
-                processed_data = json.load(f)
-                processed_files = set(processed_data.get("fileIds", []))
-        except Exception as e:
-            logger.error(f"读取已处理文件记录时出错: {e}")
+    # 获取所有文件
+    files = get_drive_files(service, folder_id)
+    if not files:
+        return []
     
     # 获取所有文件
     all_files = []
@@ -1023,28 +1046,37 @@ def cleanup_repos():
 # -----------------------------
 # 主逻辑
 # -----------------------------
-def main():
+def main(config: PlatformConfig):
     """主执行函数"""
-    logger.info("Starting satellite sites deployment...")
-    
-    # 验证配置
-    if not validate_config():
-        logger.error("Configuration validation failed. Please check your settings.")
-        return False
-    
-    # 清理旧的临时目录
-    cleanup_repos()
-    
-    # 加载数据
-    cross_links = load_cross_links(CROSS_PLATFORM_LINKS_FILE)
+    logger.info("开始部署文章...")
     
     # 从 Google Drive 获取文章
-    articles = load_articles_from_drive()
-    if not articles:
+    service = get_google_drive_service()
+    all_articles, new_articles = load_articles_from_drive(service, config)
+    
+    if not all_articles:
         logger.error("未能从 Google Drive 获取到任何文章")
         return False
     
-    logger.info(f"成功获取 {len(articles)} 篇文章")
+    # 分发文章到不同平台
+    distributed_articles = distribute_articles(all_articles, new_articles)
+    
+    # 部署到 GitHub Pages（只部署新文章）
+    if distributed_articles['github']:
+        logger.info(f"部署 {len(distributed_articles['github'])} 篇新文章到 GitHub Pages")
+        create_repo_with_content(f"{config.github_username}.github.io", distributed_articles['github'])
+    
+    # 部署到 Netlify（随机10篇，不限新旧）
+    if distributed_articles['netlify']:
+        logger.info(f"部署 {len(distributed_articles['netlify'])} 篇随机文章到 Netlify")
+        create_netlify_site(distributed_articles['netlify'])
+    
+    # 部署到 Vercel（随机10篇，不限新旧）
+    if distributed_articles['vercel']:
+        logger.info(f"部署 {len(distributed_articles['vercel'])} 篇随机文章到 Vercel")
+        create_vercel_site(distributed_articles['vercel'])
+    
+    logger.info(f"成功获取了 {len(all_articles)} 篇文章，其中 {len(new_articles)} 篇是新文章")
     logger.info(f"加载了 {len(cross_links)} 个跨平台链接")
     
     netlify_urls = []
@@ -1097,16 +1129,32 @@ def main():
     return successful_deployments > 0
 
 if __name__ == "__main__":
-    # 创建示例配置文件（如果不存在）
-    create_example_config()
-    
-    # 加载配置
-    config = load_platform_config()
-    NETLIFY_TOKEN = config.netlify_token
-    VERCEL_TOKEN = config.vercel_token
-    GITHUB_USERNAME = config.github_username
-    SATELLITE_COUNT = config.satellite_count
-    
-    success = main()
-    if not success:
+    try:
+        # 创建示例配置文件（如果不存在）
+        create_example_config()
+        
+        # 加载配置
+        config = load_platform_config()
+        if not config:
+            logger.error("无法加载配置文件")
+            exit(1)
+            
+        # 验证必要的配置
+        if not config.netlify_token:
+            logger.error("未设置 Netlify Token")
+            exit(1)
+        if not config.github_username:
+            logger.error("未设置 GitHub 用户名")
+            exit(1)
+        
+        # 运行主程序
+        success = main(config)
+        if not success:
+            logger.error("部署过程中遇到错误")
+            exit(1)
+            
+        logger.info("部署完成！")
+        
+    except Exception as e:
+        logger.error(f"运行过程中发生错误: {e}")
         exit(1)
