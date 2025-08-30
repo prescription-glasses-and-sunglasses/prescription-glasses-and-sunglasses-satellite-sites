@@ -23,27 +23,36 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 3️⃣ 安装依赖
-      - name: Install dependencies
+      # 3️⃣ 安装 Python 依赖
+      - name: Install Python dependencies
         run: |
           pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
 
-      # 4️⃣ 运行 auto_deploy.py
+      # 4️⃣ 运行 auto_deploy.py（只处理文件）
       - name: Run auto_deploy.py
         env:
           # Google Drive 配置
           GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-
-          # GitHub Actions 自带 token，用于上传到当前仓库
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-
-          # Netlify 部署
+          # Netlify 部署（由 Python 脚本处理）
           NETLIFY_TOKEN: ${{ secrets.NETLIFY_TOKEN }}
-          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+        run: python auto_deploy.py
 
-          # Vercel 部署
+      # --- Vercel 部署步骤 ---
+      # 5️⃣ 安装 Node.js (Vercel CLI 需要)
+      - name: Setup Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16'
+
+      # 6️⃣ 安装 Vercel CLI
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      # 7️⃣ 部署到 Vercel
+      - name: Deploy to Vercel
+        env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: python auto_deploy.py
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+        run: vercel --prod --token $VERCEL_TOKEN
